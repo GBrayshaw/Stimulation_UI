@@ -32,16 +32,27 @@ If you are looking to install to your own Raspberry Pi, without reformatting, fo
    pip install -r requirements.txt
    ```
 
-3. Run the application:
+3. Clone the arduino code libraries
+   ```
+   git clone <URL HERE>
+   ```
+
+4. Generate serial comms python file to src directory
+   ```
+   cd src/
+   python generate_uart_protocol.py --input <path>/uart_comms.h --output ./uart_protocol.py
+   ```
+
+5. Run the application:
    ```
    python src/app.py
    ```
 
 ## Usage
 
-This app expects a connection between the systems' switching board MCU and the Raspberry Pi via USB. The user board will also be connected to the Pi via USB.
+This app expects a connection between the systems' control board MCU and the Raspberry Pi via UART. The user board will be connected to the Pi via USB.
 
-Before launching the UI, run the ***serial_search*** script and follow the onscreen instructions. This program allows the system to identify the control board and user board that you have connected. This is done so that subsequent uses of the system do not require setup. This script should be run each time a different Pi, switching board, or user board are used in this system.
+<!-- Before launching the UI, run the ***serial_search*** script and follow the onscreen instructions. This program allows the system to identify the control board and user board that you have connected. This is done so that subsequent uses of the system do not require setup. This script should be run each time a different Pi, switching board, or user board are used in this system. -->
 
 IMAGE OF UI
 

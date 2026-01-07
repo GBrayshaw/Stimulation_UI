@@ -3,6 +3,7 @@ import threading
 import struct
 import time
 import uart_protocol
+import queue
 
 
 # Bind protocol constants from generated module
@@ -25,7 +26,7 @@ class UART_COMMS:
 		self.baudrate = baudrate
 		self.comm_state = 1  # 0: User Mode, 1: PC Mode
 		self.record = True
-		self.heartbeat_f = heartbeat_f
+		self.heartbeat_f = HEARTBEAT_TIMEOUT_MS / 1000.0 * 2  # send at twice the timeout rate
 		self.last_ctrl_heartbeat = 0.0
 		self.connected = False
 
@@ -33,6 +34,8 @@ class UART_COMMS:
 		self._write_lock = threading.Lock()
 		self._line_buf = []  # synthesized text lines for UI compatibility
 		self._hb_thread = None
+		self._rx_thread = None
+		self._events = queue.Queue()
 
 		self.ser = serial.Serial(
 			port=self.port,
@@ -132,9 +135,10 @@ class UART_COMMS:
 				# Echo ACK back to confirm link
 				with self._write_lock:
 					self.ser.write(ack_packet)
-				
-				self._start_heartbeat()
+
 				self.connected = True
+				# Start background heartbeat TX and RX processing
+				self.start_link_maintenance()
 				return True
 
 			now = time.monotonic()
@@ -161,17 +165,65 @@ class UART_COMMS:
 		self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
 		self._hb_thread.start()
 
+	def _rx_loop(self):
+		while not self._stop_event.is_set():
+			pkt = self._read_packet(timeout_s=0.2)
+			if not pkt:
+				continue
+			msg_type, payload_type, payload = pkt
+			self.last_ctrl_heartbeat = time.monotonic()
+			# Parse shutdown message and enqueue event with source
+			if msg_type == MODE.UART_MSG_SHUTDOWN:
+				shutdown_src = None
+				try:
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+						shutdown_src = int.from_bytes(payload, byteorder='big', signed=True)
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+						shutdown_src = int(payload[0])
+				except Exception:
+					shutdown_src = None
+				try:
+					self._events.put({"type": "shutdown", "source": shutdown_src})
+				except Exception:
+					pass
+
+	def _start_rx(self):
+		if self._rx_thread and self._rx_thread.is_alive():
+			return
+		self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
+		self._rx_thread.start()
+
+	def start_link_maintenance(self):
+		# Ensure stop flag is clear and start background TX/RX
+		if self._stop_event.is_set():
+			self._stop_event = threading.Event()
+		self.last_ctrl_heartbeat = time.monotonic()
+		self._start_heartbeat()
+		self._start_rx()
+
+	def stop_link_maintenance(self):
+		# Stop background threads but keep serial open
+		self._stop_event.set()
+		try:
+			if self._hb_thread:
+				self._hb_thread.join(timeout=1.0)
+		except Exception:
+			pass
+		try:
+			if self._rx_thread:
+				self._rx_thread.join(timeout=1.0)
+		except Exception:
+			pass
+		self._hb_thread = None
+		self._rx_thread = None
+
 	# TODO: Logic for recieving data
 	def read(self, timeout_s: float = 0.5):
-		msg_type, payload_type, payload = self._read_packet(timeout_s=timeout_s)
-
-		if msg_type is not None:
-			self.last_ctrl_heartbeat = time.monotonic()
-
-			if msg_type == MODE.UART_MSG_ERROR:
-				# TODO: Handle error
-				pass
-
+		res = self._read_packet(timeout_s=timeout_s)
+		if not res:
+			return None, None, None
+		msg_type, payload_type, payload = res
+		self.last_ctrl_heartbeat = time.monotonic()
 		return msg_type, payload_type, payload
 
 	def toggle_PC_usr(self):
@@ -186,22 +238,41 @@ class UART_COMMS:
 			self._send_packet(MODE.UART_MSG_RECORD)
 			self.record = True
 
-	def send_stim_ack(self):
-		self._send_packet(MODE.UART_MSG_STIM_ACK)
+	def send_shutdown(self, source: int | None = None):
+		# Default to SHUTDOWN_SRC_PI when source not provided
+		try:
+			src = source if source is not None else getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_PI', 3)
+		except Exception:
+			src = 3
+		self._send_packet(MODE.UART_MSG_SHUTDOWN, int(src), PAYLOAD_TYPE.PAYLOAD_INT32)
+
+	def send_start(self):
+		# Send a START command (no payload)
+		self._send_packet(MODE.UART_MSG_START)
 
 	def set_stim_amplitude(self, amplitude):
 		self._send_packet(MODE.UART_MSG_UPDATE_AMP, float(amplitude), PAYLOAD_TYPE.PAYLOAD_FLOAT32)
 
 	def set_pulse_width(self, width):
-		self._send_packet(MODE.UART_MSG_UPDATE_WIDTH, ival, PAYLOAD_TYPE.PAYLOAD_INT32)
+		self._send_packet(MODE.UART_MSG_UPDATE_WIDTH, int(width), PAYLOAD_TYPE.PAYLOAD_INT32)
 
-	def close(self):
-		self._stop_event.set()
+	def is_link_alive(self, timeout_ms: int | None = None) -> bool:
+		if self.last_ctrl_heartbeat <= 0:
+			return False
+		limit_ms = HEARTBEAT_TIMEOUT_MS if timeout_ms is None else timeout_ms
+		return (time.monotonic() - self.last_ctrl_heartbeat) < (limit_ms / 1000.0)
+
+	def get_events(self, max_items: int = 10):
+		items = []
 		try:
-			if self._hb_thread:
-				self._hb_thread.join(timeout=1.0)
+			for _ in range(max_items):
+				items.append(self._events.get_nowait())
 		except Exception:
 			pass
+		return items
+
+	def close(self):
+		self.stop_link_maintenance()
 		try:
 			self.ser.close()
 		except Exception:

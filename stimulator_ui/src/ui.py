@@ -1,6 +1,7 @@
-from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox
+from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox, Frame
 from datetime import datetime
 from stim_io import UART_COMMS
+import uart_protocol
 from user_io import USER_COMMS
 import serial
 import serial.tools.list_ports
@@ -52,11 +53,16 @@ class AppUI:
         self.done_but = Button(master, text="Done", command=self.apply_settings, width=10, height=2)
         self.done_but.grid(row=4, column=0, columnspan=2, padx=10, pady=10)
 
-        self.STOP_but = Button(master, text="STOP", command=self.STOP, width=10, height=2, state=DISABLED)
-        self.STOP_but.grid(row=4, column=2, rowspan=3, padx=10, pady=10)
+        # Control actions: START above STOP in a stacked frame
+        self.ctrl_actions = Frame(master)
+        self.ctrl_actions.grid(row=4, column=2, padx=10, pady=10, sticky="n")
+        self.start_but = Button(self.ctrl_actions, text="START", command=self.start_system, width=10, height=2, state=DISABLED)
+        self.start_but.pack(padx=5, pady=(0,5))
+        self.STOP_but = Button(self.ctrl_actions, text="STOP", command=self.STOP, width=10, height=2, state=DISABLED)
+        self.STOP_but.pack(padx=5, pady=5)
 
         # Reconnect button
-        self.reconnect_but = Button(master, text="Reconnect", command=self.connect_control_board, state=NORMAL)
+        self.reconnect_but = Button(master, text="Reconnect", command=self.start_auto_connect, state=NORMAL)
         self.reconnect_but.grid(row=6, column=2, rowspan=3, padx=10, pady=10)
 
         # Reconnect User Board button
@@ -109,49 +115,183 @@ class AppUI:
         self.user_board = None
 
         self.pc_usr_toggle = 1
-        # load_serial_numbers kept for compatibility but it won't read device_serials.txt
-        self.connect_control_board()
+        # Heartbeat monitoring
+        self._hb_timeout_ms = getattr(uart_protocol, 'HEARTBEAT_TIMEOUT_MS', 300)
+        self._hb_timeout_multiplier = 1.5  # Add margin to avoid false positives at startup
+        self._hb_check_interval_ms = max(50, int(self._hb_timeout_ms / 2))
+        self._hb_monitor_id = None
+        self._hb_warmup_until = None  # grace window after connect
+        self._hb_tripped = False
+
+        # Connection attempt state (non-blocking auto-connect)
+        self._connect_after_id = None
+        self._connect_retry_ms = 250
+        self._connect_attempts = 0
+
+        # Start UI immediately and begin seeking the control board
+        self.log_event(f"Seeking control board on {self.control_board_serial}...")
+        self.start_auto_connect()
         # self.initialise_user_board()
 
     def connect_control_board(self):
+        # Backward-compatible entrypoint: kick off non-blocking auto-connect
+        self.start_auto_connect()
+
+    def start_auto_connect(self):
+        # Cancel any pending attempts to avoid duplicates
+        if self._connect_after_id is not None:
+            try:
+                self.master.after_cancel(self._connect_after_id)
+            except Exception:
+                pass
+            self._connect_after_id = None
+        self._connect_attempts = 0
+        # Disable reconnect while attempting/connected
+        try:
+            self.reconnect_but.config(state=DISABLED)
+        except Exception:
+            pass
+        self._connect_after_id = self.master.after(10, self._connect_step)
+
+    def _connect_step(self):
+        self._connect_after_id = None
         if not self.control_board_serial:
-            self.log_event("Control board serial port not set.")    # NOTE: Currently no way of setting in UI
-            self.log_event("WARNING: NO CURRENT METHOD TO SET PORT IN UI. PLEASE EDIT THE CODE TO SET THE PORT.")
+            self.log_event("Control board serial port not set. Please edit the code to set the port.")
             self.disable_uart_controls()
             return
-        else:
-            try:
+        try:
+            if self.control_uart is None:
                 self.control_uart = UART_COMMS(port=self.control_board_serial, baudrate=9600)
-                self.log_event("Attempting handshake with control board...")
-                
-                for i in range(20):     # NOTE: Numbers currently arbraitrary; adjust as needed
-                    if self.control_handshake():
-                        break
-                    self.log_event(f"Handshake {i} failed; retrying in 0.25s...")
-                    time.sleep(0.25)
-                    if i == 19:
-                        raise ConnectionError("Handshake failed after multiple attempts.")
-
+            ok = False
+            try:
+                # Keep handshake short to avoid blocking the UI loop
+                ok = self.control_uart.handshake(overall_timeout_s=0.5, resend_interval_s=0.25)
+            except Exception as e:
+                ok = False
+            if ok:
                 self.log_event(f"Control board connected on port {self.control_board_serial}.")
                 self.enable_uart_controls()
-            except Exception as e:
-                self.log_event(f"Failed to connect to control board: {e}")
-                self.disable_uart_controls()
+                # Start heartbeat monitor
+                self._hb_tripped = False
+                # Start heartbeat monitor with warmup
+                self._hb_warmup_until = time.monotonic() + 3.0
+                self._schedule_heartbeat_monitor()
+                return
+            else:
+                # Not connected yet; retry
+                self._connect_attempts += 1
+                if self._connect_attempts % 10 == 0:
+                    self.log_event("Still seeking control board...")
+        except Exception as e:
+            # On failure, clean up and retry later
+            try:
+                if self.control_uart:
+                    self.control_uart.close()
+            except Exception:
+                pass
+            self.control_uart = None
+        # Schedule next attempt
+        self._connect_after_id = self.master.after(self._connect_retry_ms, self._connect_step)
 
     def control_handshake(self):
-        """Perform a handshake with the control board over UART."""
+        """Perform a handshake with the control board over UART using protocol ACK."""
         if not self.control_uart:
             self.log_event("No control board currently connected for handshake.")
             return False
         try:
-            self.control_uart.send_stim_ack()
-            type, _, __ = self.control_uart.read()
-            if type is UART_COMMS.MSG_TYPE.ACK:
-                return True
-            else:
-                return False
-        except Exception:
+            ok = self.control_uart.handshake()
+            return bool(ok)
+        except Exception as e:
+            self.log_event(f"Handshake exception: {e}")
             return False
+
+    def _schedule_heartbeat_monitor(self):
+        # Schedule periodic heartbeat checks on the Tk loop
+        if self._hb_monitor_id is not None:
+            try:
+                self.master.after_cancel(self._hb_monitor_id)
+            except Exception:
+                pass
+        self._hb_monitor_id = self.master.after(self._hb_check_interval_ms, self._heartbeat_watchdog)
+
+        # Also start event poller for incoming UART events
+        try:
+            if getattr(self, '_evt_poll_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._evt_poll_id)
+                except Exception:
+                    pass
+                self._evt_poll_id = None
+            self._evt_poll_id = self.master.after(100, self._event_poller)
+        except Exception:
+            pass
+
+    def _heartbeat_watchdog(self):
+        # Reschedule first to keep periodic cadence
+        self._hb_monitor_id = self.master.after(self._hb_check_interval_ms, self._heartbeat_watchdog)
+        if not self.control_uart:
+            return
+        # Warmup grace period after connect to avoid false positives
+        try:
+            if self._hb_warmup_until is not None and time.monotonic() < self._hb_warmup_until:
+                return
+        except Exception:
+            pass
+        try:
+            threshold = int(self._hb_timeout_ms * self._hb_timeout_multiplier)
+            alive = self.control_uart.is_link_alive(threshold)
+        except Exception:
+            alive = False
+        if not alive and not self._hb_tripped:
+            self._hb_tripped = True
+            # Attempt to send shutdown to control board
+            try:
+                self.control_uart.send_shutdown()
+            except Exception:
+                pass
+            self.log_event("Heartbeat lost: sent SHUTDOWN and marking control board disconnected.")
+            try:
+                # Stop background threads and close port cleanly
+                try:
+                    self.control_uart.stop_link_maintenance()
+                except Exception:
+                    pass
+                self.control_uart.close()
+            except Exception:
+                pass
+            self.control_uart = None
+            self.disable_uart_controls()
+            self.reconnect_but.config(state=NORMAL)
+
+    def _event_poller(self):
+        # Poll UART events and log shutdown origin
+        try:
+            self._evt_poll_id = self.master.after(100, self._event_poller)
+            if not self.control_uart:
+                return
+            events = []
+            try:
+                events = self.control_uart.get_events(max_items=10)
+            except Exception:
+                events = []
+            for ev in events:
+                if not isinstance(ev, dict):
+                    continue
+                if ev.get("type") == "shutdown":
+                    src = ev.get("source")
+                    origin = "Unknown"
+                    try:
+                        if src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_PI', 3):
+                            origin = "Raspberry Pi"
+                        elif src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_CONTROL', 1):
+                            origin = "Control Board"
+                        elif src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_STIM', 2):
+                            origin = "Stimulator Board"
+                    except Exception:
+                        pass
+                    self.log_event(f"Shutdown message received from: {origin}")
+        except Exception:
+            pass
 
     # def initialise_user_board(self):
     #     """Initialize the connection to the user board."""
@@ -200,17 +340,27 @@ class AppUI:
         self.stim_amplitude = self.pending_stim_amplitude
         self.pulse_width = self.pending_pulse_width
         self.log_event(f"Applied settings: Stim Amplitude = {self.stim_amplitude:.2f}uA, Pulse Width = {self.pulse_width:.2f}")
-        if self.uart:
-            self.uart.set_stim_amplitude(self.stim_amplitude)
-            self.uart.set_pulse_width(self.pulse_width)
+        if not self.control_uart:
+            self.log_event("Cannot apply settings: control board not connected.")
+            return
+        try:
+            # Send width (int) and amplitude (float) to control board
+            self.control_uart.set_pulse_width(self.pulse_width)
+            self.control_uart.set_stim_amplitude(self.stim_amplitude)
+            self.log_event("Settings sent to control board.")
+        except Exception as e:
+            self.log_event(f"Failed to send settings: {e}")
 
     def STOP(self):
-        if self.uart:
-            ack = self.uart.STOP()
-        if ack:
-            self.log_event("STIMULATION STOPPED")
-        else:
-            self.log_event("STOP ACK not received")
+        # Send SHUTDOWN message without closing connections or window
+        if not self.control_uart:
+            self.log_event("Cannot STOP: control board not connected.")
+            return
+        try:
+            self.control_uart.send_shutdown()
+            self.log_event("STOP: sent SHUTDOWN to control board.")
+        except Exception as e:
+            self.log_event(f"STOP: failed to send SHUTDOWN: {e}")
 
     def toggle_trigger(self):
         if self.uart:
@@ -268,6 +418,7 @@ class AppUI:
         self.triggers_switch.config(state=NORMAL)
         self.pc_user_switch.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
+        self.start_but.config(state=NORMAL)
 
     def pc_mode_ui(self):
         self.stim_up_but.config(state=DISABLED)
@@ -279,6 +430,7 @@ class AppUI:
         self.triggers_switch.config(state=DISABLED)
         self.recording_switch.config(state=DISABLED)
         self.poll_status_but.config(state=DISABLED)
+        self.start_but.config(state=DISABLED)
 
     def user_mode_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -289,6 +441,7 @@ class AppUI:
         self.pulse_width_entry.config(state=NORMAL)
         self.triggers_switch.config(state=NORMAL)
         self.recording_switch.config(state=NORMAL)
+        self.start_but.config(state=NORMAL)
 
     def update_stim_amplitude(self, event):
         """Update the pending stimulation amplitude from the entry box."""
@@ -336,6 +489,7 @@ class AppUI:
         self.STOP_but.config(state=DISABLED)
         self.done_but.config(state=DISABLED)
         self.poll_status_but.config(state=DISABLED)
+        self.start_but.config(state=DISABLED)
 
     def enable_uart_controls(self):
         """Enable only the controls that require the control board (UART)."""
@@ -355,6 +509,17 @@ class AppUI:
         self.STOP_but.config(state=NORMAL)
         self.done_but.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
+        self.start_but.config(state=NORMAL)
+
+    def start_system(self):
+        if not self.control_uart:
+            self.log_event("Cannot START: control board not connected.")
+            return
+        try:
+            self.control_uart.send_start()
+            self.log_event("START: sent START to control board.")
+        except Exception as e:
+            self.log_event(f"START: failed to send START: {e}")
 
     def enable_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -371,10 +536,76 @@ class AppUI:
         self.poll_status_but.config(state=NORMAL)
 
     def close(self):
-        if self.uart:
-            self.STOP()
-            self.uart.close()
-        self.master.destroy()
+        # Graceful close when window is closed
+        try:
+            self._cancel_scheduled_callbacks()
+        except Exception:
+            pass
+
+        # Close user serial if present
+        try:
+            if self.user_board:
+                self.user_board.close()
+        except Exception:
+            pass
+        finally:
+            self.user_board = None
+
+        # Send SHUTDOWN, stop UART threads, and close serial if present
+        try:
+            if self.control_uart:
+                try:
+                    self.control_uart.send_shutdown()
+                except Exception:
+                    pass
+                try:
+                    self.control_uart.stop_link_maintenance()
+                except Exception:
+                    pass
+                try:
+                    self.control_uart.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self.control_uart = None
+
+        # Finally destroy the window
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
+
+    def _cancel_scheduled_callbacks(self):
+        # Helper to cancel Tk after() callbacks for connect/heartbeat loops
+        try:
+            if getattr(self, '_hb_monitor_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._hb_monitor_id)
+                except Exception:
+                    pass
+                self._hb_monitor_id = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_evt_poll_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._evt_poll_id)
+                except Exception:
+                    pass
+                self._evt_poll_id = None
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_connect_after_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._connect_after_id)
+                except Exception:
+                    pass
+                self._connect_after_id = None
+        except Exception:
+            pass
     
     def poll_status(self):
         """Send an <ACK> message to the serial device and log the response."""
@@ -462,26 +693,22 @@ class AppUI:
             pass
 
         try:
-            if self.uart:
+            if self.control_uart:
                 try:
-                    # Ask control board to STOP and wait for ACK before closing comms
+                    # Best-effort shutdown message, then stop threads and close
                     try:
-                        self.log_event("Sending STOP to control board before shutdown...")
-                        stopped = self.uart.STOP(attempts=5)
-                    except Exception as e:
-                        stopped = False
-                        self.log_event(f"Error sending STOP to control board: {e}")
-
-                    if stopped:
-                        self.log_event("Control board acknowledged STOP.")
-                    else:
-                        self.log_event("Control board did not acknowledge STOP; proceeding to close comms.")
-
-                    try:
-                        self.uart.close()
+                        self.control_uart.send_shutdown()
                     except Exception:
                         pass
-                    self.uart = None
+                    try:
+                        self.control_uart.stop_link_maintenance()
+                    except Exception:
+                        pass
+                    try:
+                        self.control_uart.close()
+                    except Exception:
+                        pass
+                    self.control_uart = None
                 except Exception:
                     pass
         except Exception:
@@ -491,8 +718,8 @@ class AppUI:
         def _all_closed():
             uart_open = False
             user_open = False
-            if self.uart:
-                ser = getattr(self.uart, 'ser', None)
+            if self.control_uart:
+                ser = getattr(self.control_uart, 'ser', None)
                 uart_open = bool(ser and getattr(ser, 'is_open', False))
             if self.user_board:
                 ser2 = getattr(self.user_board, 'ser', None)
@@ -506,6 +733,7 @@ class AppUI:
             if _all_closed():
                 self.log_event("All serial connections closed. Exiting application.")
                 try:
+                    self._cancel_scheduled_callbacks()
                     self.master.destroy()
                 except Exception:
                     pass
@@ -516,6 +744,7 @@ class AppUI:
         # Timeout expired, still closing to avoid hanging
         self.log_event("Timeout waiting for serial connections to close; exiting application anyway.")
         try:
+            self._cancel_scheduled_callbacks()
             self.master.destroy()
         except Exception:
             pass
