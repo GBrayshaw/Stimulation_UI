@@ -186,6 +186,20 @@ class UART_COMMS:
 					self._events.put({"type": "shutdown", "source": shutdown_src})
 				except Exception:
 					pass
+			# Parse status reports and enqueue status code
+			elif msg_type == MODE.UART_MSG_STATUS:
+				try:
+					code = None
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+						code = int.from_bytes(payload, byteorder='big', signed=True)
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+						# accept first 4 bytes as big-endian int if provided
+						b = bytes(payload[:4]).ljust(4, b"\x00")
+						code = int.from_bytes(b, byteorder='big', signed=True)
+					if code is not None:
+						self._events.put({"type": "status", "code": code})
+				except Exception:
+					pass
 			# Parse parameter reports from control board and enqueue updates
 			elif msg_type == MODE.UART_MSG_SEND_WIDTH:
 				try:

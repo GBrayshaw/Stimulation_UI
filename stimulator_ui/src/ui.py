@@ -290,16 +290,58 @@ class AppUI:
                 if ev.get("type") == "shutdown":
                     src = ev.get("source")
                     origin = "Unknown"
+                    reason = None
                     try:
-                        if src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_PI', 3):
+                        SRC = uart_protocol.SHUTDOWN_SRC
+                        if src == getattr(SRC, 'SHUTDOWN_SRC_PI', 3):
                             origin = "Raspberry Pi"
-                        elif src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_CONTROL', 1):
+                        elif src == getattr(SRC, 'SHUTDOWN_SRC_CONTROL', 1):
                             origin = "Control Board"
-                        elif src == getattr(uart_protocol.SHUTDOWN_SRC, 'SHUTDOWN_SRC_STIM', 2):
+                        elif src == getattr(SRC, 'SHUTDOWN_SRC_STIM', 2):
                             origin = "Stimulator Board"
+                        elif src == getattr(SRC, 'SHUTDOWN_SRC_CONTROL_PI_HEARTBEAT_LOSS', 4):
+                            origin = "Control Board"
+                            reason = "Raspberry Pi heartbeat lost"
+                        elif src == getattr(SRC, 'SHUTDOWN_SRC_CONTROL_STIM_HEARTBEAT_LOSS', 5):
+                            origin = "Control Board"
+                            reason = "Stimulator Board heartbeat lost"
+                        elif src == getattr(SRC, 'SHUTDOWN_SRC_STIM_CONTROL_HEARTBEAT_LOSS', 6):
+                            origin = "Stimulator Board"
+                            reason = "Control Board heartbeat lost"
                     except Exception:
                         pass
-                    self.log_event(f"Shutdown message received from: {origin}")
+                    if reason:
+                        self.log_event(f"Shutdown: {origin} — reason: {reason}")
+                    else:
+                        self.log_event(f"Shutdown message received from: {origin}")
+                elif ev.get("type") == "status":
+                        code = ev.get("code")
+                        msg = None
+                        try:
+                            SC = uart_protocol.STATUS_CODE
+                            if code == getattr(SC, 'STATUS_INTERLOCK_ON', 1):
+                                msg = "Stim Status: Interlocks ON"
+                            elif code == getattr(SC, 'STATUS_INTERLOCK_OFF', 2):
+                                msg = "Stim Status: Interlocks OFF"
+                            elif code == getattr(SC, 'STATUS_STIM_ON', 3):
+                                msg = "Stim Status: Stimulation ON"
+                            elif code == getattr(SC, 'STATUS_STIM_OFF', 4):
+                                msg = "Stim Status: Stimulation OFF"
+                            elif code == getattr(SC, 'STATUS_CTRL_SHUTDOWN_RTN', 100):
+                                msg = "Control Status: Shutdown routine complete"
+                            elif code == getattr(SC, 'STATUS_CTRL_STIM_RTN', 101):
+                                msg = "Control Status: Stim routine complete"
+                            elif code == getattr(SC, 'STATUS_CTRL_AMP_RTN', 102):
+                                msg = "Control Status: Amplitude routine complete"
+                        except Exception:
+                            msg = None
+                        if msg:
+                            self.log_event(msg)
+                        else:
+                            try:
+                                self.log_event(f"Status code received: {int(code)}")
+                            except Exception:
+                                self.log_event("Status message received")
                 elif ev.get("type") == "send_width":
                     width = ev.get("width")
                     if width is not None:
