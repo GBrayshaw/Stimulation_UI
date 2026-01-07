@@ -60,8 +60,10 @@ class AppUI:
         self.ctrl_actions.grid(row=4, column=2, padx=10, pady=10, sticky="n")
         self.start_but = Button(self.ctrl_actions, text="Unlock Interlocks", command=self.start_system, width=16, height=2, state=DISABLED)
         self.start_but.pack(padx=5, pady=(0,5))
+        self.start_stim_but = Button(self.ctrl_actions, text="Start Stim", command=self.start_stim, width=12, height=2, state=DISABLED)
+        self.start_stim_but.pack(padx=5, pady=5)
         self.STOP_but = Button(self.ctrl_actions, text="STOP", command=self.STOP, width=10, height=2, state=DISABLED)
-        self.STOP_but.pack(padx=5, pady=5)
+        self.STOP_but.pack(padx=5, pady=(5,0))
 
         # Reconnect button
         self.reconnect_but = Button(master, text="Reconnect", command=self.start_auto_connect, state=NORMAL)
@@ -447,6 +449,7 @@ class AppUI:
         self.pc_user_switch.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
         self.start_but.config(state=NORMAL)
+        self.start_stim_but.config(state=NORMAL)
 
     def pc_mode_ui(self):
         self.stim_up_but.config(state=DISABLED)
@@ -459,6 +462,7 @@ class AppUI:
         self.recording_switch.config(state=DISABLED)
         self.poll_status_but.config(state=DISABLED)
         self.start_but.config(state=DISABLED)
+        self.start_stim_but.config(state=DISABLED)
 
     def user_mode_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -470,6 +474,7 @@ class AppUI:
         self.triggers_switch.config(state=NORMAL)
         self.recording_switch.config(state=NORMAL)
         self.start_but.config(state=NORMAL)
+        self.start_stim_but.config(state=NORMAL)
 
     def update_stim_amplitude(self, event):
         """Update the pending stimulation amplitude from the entry box."""
@@ -501,6 +506,7 @@ class AppUI:
         self.pc_user_switch.config(state=DISABLED)
         self.STOP_but.config(state=DISABLED)
         self.done_but.config(state=DISABLED)
+        self.start_stim_but.config(state=DISABLED)
 
     def disable_uart_controls(self):
         """Disable only the controls that require the control board (UART)."""
@@ -518,6 +524,7 @@ class AppUI:
         self.done_but.config(state=DISABLED)
         self.poll_status_but.config(state=DISABLED)
         self.start_but.config(state=DISABLED)
+        self.start_stim_but.config(state=DISABLED)
 
     def enable_uart_controls(self):
         """Enable only the controls that require the control board (UART)."""
@@ -538,16 +545,27 @@ class AppUI:
         self.done_but.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
         self.start_but.config(state=NORMAL)
+        self.start_stim_but.config(state=NORMAL)
 
     def start_system(self):
         if not self.control_uart:
             self.log_event("Cannot Unlock Interlocks: control board not connected.")
             return
         try:
-            self.control_uart.send_start()
+            self.control_uart.send_unlock()
             self.log_event("Unlocking Interlocks.")
         except Exception as e:
             self.log_event(f"Unlocking Interlocks: failed to send command: {e}")
+
+    def start_stim(self):
+        if not self.control_uart:
+            self.log_event("Cannot Start Stim: control board not connected.")
+            return
+        try:
+            self.control_uart.send_start_stim()
+            self.log_event("Start Stim command sent.")
+        except Exception as e:
+            self.log_event(f"Start Stim: failed to send command: {e}")
 
     def enable_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -562,6 +580,7 @@ class AppUI:
         self.STOP_but.config(state=NORMAL)
         self.done_but.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
+        self.start_stim_but.config(state=NORMAL)
 
     def close(self):
         # Graceful close when window is closed

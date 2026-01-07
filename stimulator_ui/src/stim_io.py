@@ -271,13 +271,17 @@ class UART_COMMS:
 			src = 3
 		self._send_packet(MODE.UART_MSG_SHUTDOWN, int(src), PAYLOAD_TYPE.PAYLOAD_INT32)
 
-	def send_start(self):
+	def send_unlock(self):
 		# Send a START command (no payload)
-		self._send_packet(MODE.UART_MSG_START)
+		self._send_packet(MODE.UART_MSG_UNLOCK)
 
 	def send_get_params(self):
 		# Request current parameters from control board
 		self._send_packet(MODE.UART_MSG_GET_PARAMS)
+
+	def send_start_stim(self):
+		# Send START_STIM command (no payload)
+		self._send_packet(MODE.UART_MSG_START_STIM)
 
 	def set_stim_amplitude(self, amplitude):
 		self._send_packet(MODE.UART_MSG_UPDATE_AMP, float(amplitude), PAYLOAD_TYPE.PAYLOAD_FLOAT32)
