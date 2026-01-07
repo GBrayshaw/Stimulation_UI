@@ -186,6 +186,31 @@ class UART_COMMS:
 					self._events.put({"type": "shutdown", "source": shutdown_src})
 				except Exception:
 					pass
+			# Parse parameter reports from control board and enqueue updates
+			elif msg_type == MODE.UART_MSG_SEND_WIDTH:
+				try:
+					width = None
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+						width = int.from_bytes(payload, byteorder='big', signed=True)
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+						# accept first 4 bytes when provided as raw
+						b = bytes(payload[:4]).ljust(4, b"\x00")
+						width = int.from_bytes(b, byteorder='big', signed=True)
+					if width is not None:
+						self._events.put({"type": "send_width", "width": width})
+				except Exception:
+					pass
+			elif msg_type == MODE.UART_MSG_SEND_AMP:
+				try:
+					amp = None
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_FLOAT32 and payload and len(payload) == 4:
+						amp = struct.unpack('>f', payload)[0]
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload and len(payload) >= 4:
+						amp = struct.unpack('>f', bytes(payload[:4]))[0]
+					if amp is not None:
+						self._events.put({"type": "send_amp", "amp": float(amp)})
+				except Exception:
+					pass
 
 	def _start_rx(self):
 		if self._rx_thread and self._rx_thread.is_alive():
@@ -249,6 +274,10 @@ class UART_COMMS:
 	def send_start(self):
 		# Send a START command (no payload)
 		self._send_packet(MODE.UART_MSG_START)
+
+	def send_get_params(self):
+		# Request current parameters from control board
+		self._send_packet(MODE.UART_MSG_GET_PARAMS)
 
 	def set_stim_amplitude(self, amplitude):
 		self._send_packet(MODE.UART_MSG_UPDATE_AMP, float(amplitude), PAYLOAD_TYPE.PAYLOAD_FLOAT32)

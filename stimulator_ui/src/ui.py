@@ -23,12 +23,14 @@ class AppUI:
 
         # Display Labels
         self.stim_amplitude_var = StringVar()
-        self.stim_amplitude_var.set(f"Stim Amplitude: {self.stim_amplitude:.2f}uA")
+        # Show placeholder until first value received from control board
+        self.stim_amplitude_var.set("Stim Amplitude: — uA")
         self.stim_amplitude_label = Label(master, textvariable=self.stim_amplitude_var)
         self.stim_amplitude_label.grid(row=0, column=0, columnspan=2, padx=10, pady=10)
 
         self.pulse_width_var = StringVar()
-        self.pulse_width_var.set(f"Pulse Width: {self.pulse_width:.2f}")
+        # Show placeholder until first value received from control board
+        self.pulse_width_var.set("Pulse Width: —")
         self.pulse_width_label = Label(master, textvariable=self.pulse_width_var)
         self.pulse_width_label.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
 
@@ -56,7 +58,7 @@ class AppUI:
         # Control actions: START above STOP in a stacked frame
         self.ctrl_actions = Frame(master)
         self.ctrl_actions.grid(row=4, column=2, padx=10, pady=10, sticky="n")
-        self.start_but = Button(self.ctrl_actions, text="START", command=self.start_system, width=10, height=2, state=DISABLED)
+        self.start_but = Button(self.ctrl_actions, text="Unlock Interlocks", command=self.start_system, width=16, height=2, state=DISABLED)
         self.start_but.pack(padx=5, pady=(0,5))
         self.STOP_but = Button(self.ctrl_actions, text="STOP", command=self.STOP, width=10, height=2, state=DISABLED)
         self.STOP_but.pack(padx=5, pady=5)
@@ -260,6 +262,12 @@ class AppUI:
             except Exception:
                 pass
             self.control_uart = None
+            # Reset UI displayed values to placeholders
+            try:
+                self.stim_amplitude_var.set("Stim Amplitude: — uA")
+                self.pulse_width_var.set("Pulse Width: —")
+            except Exception:
+                pass
             self.disable_uart_controls()
             self.reconnect_but.config(state=NORMAL)
 
@@ -290,6 +298,26 @@ class AppUI:
                     except Exception:
                         pass
                     self.log_event(f"Shutdown message received from: {origin}")
+                elif ev.get("type") == "send_width":
+                    width = ev.get("width")
+                    if width is not None:
+                        try:
+                            self.pulse_width = float(width)
+                            self.pending_pulse_width = float(width)
+                            self.pulse_width_var.set(f"Pulse Width: {self.pulse_width:.2f}")
+                            self.log_event(f"Control board width updated: {width}")
+                        except Exception:
+                            pass
+                elif ev.get("type") == "send_amp":
+                    amp = ev.get("amp")
+                    if amp is not None:
+                        try:
+                            self.stim_amplitude = float(amp)
+                            self.pending_stim_amplitude = float(amp)
+                            self.stim_amplitude_var.set(f"Stim Amplitude: {self.stim_amplitude:.2f}uA")
+                            self.log_event(f"Control board amplitude updated: {self.stim_amplitude:.2f}uA")
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -513,13 +541,13 @@ class AppUI:
 
     def start_system(self):
         if not self.control_uart:
-            self.log_event("Cannot START: control board not connected.")
+            self.log_event("Cannot Unlock Interlocks: control board not connected.")
             return
         try:
             self.control_uart.send_start()
-            self.log_event("START: sent START to control board.")
+            self.log_event("Unlocking Interlocks.")
         except Exception as e:
-            self.log_event(f"START: failed to send START: {e}")
+            self.log_event(f"Unlocking Interlocks: failed to send command: {e}")
 
     def enable_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -608,20 +636,15 @@ class AppUI:
             pass
     
     def poll_status(self):
-        """Send an <ACK> message to the serial device and log the response."""
-        if self.uart:
-            raw = self.uart_handshake()
-            if raw is None:
-                self.log_event("No response to <ACK>; UART comms appear disconnected.")
-                self.handle_uart_disconnect("no response to <ACK>")
-                return
+        """Request current parameters via GET_PARAMS and log action."""
+        if self.control_uart:
             try:
-                response = raw.decode('utf-8').strip()
-            except Exception:
-                response = repr(raw)
-            self.log_event(f"Poll Status Response: {response}")
+                self.control_uart.send_get_params()
+                self.log_event("Requested parameter sync. Waiting for response...")
+            except Exception as e:
+                self.log_event(f"Failed to request params: {e}")
         else:
-            self.log_event("Cannot poll status: UART comms not connected.")
+            self.log_event("Cannot request params: control board not connected.")
 
     def check_user_board_connection(self):
         """Check if the user board is still connected."""
