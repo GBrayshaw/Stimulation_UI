@@ -14,6 +14,41 @@ UART_END_BYTE = uart_protocol.UART_END_BYTE
 UART_MAX_PAYLOAD = uart_protocol.UART_MAX_PAYLOAD
 HEARTBEAT_TIMEOUT_MS = uart_protocol.HEARTBEAT_TIMEOUT_MS
 
+# Extended message type fallbacks for frequency and burst length. If the
+# generated uart_protocol module already defines these on MODE, use those
+# values; otherwise, fall back to the literal codes aligned with the C++
+# uart_comms.h definition.
+try:
+	UART_MSG_UPDATE_FREQ = getattr(MODE, "UART_MSG_UPDATE_FREQ")
+except AttributeError:
+	UART_MSG_UPDATE_FREQ = 0x10
+
+try:
+	UART_MSG_UPDATE_BURST = getattr(MODE, "UART_MSG_UPDATE_BURST")
+except AttributeError:
+	UART_MSG_UPDATE_BURST = 0x11
+
+try:
+	UART_MSG_SEND_FREQ = getattr(MODE, "UART_MSG_SEND_FREQ")
+except AttributeError:
+	UART_MSG_SEND_FREQ = 0x12
+
+try:
+	UART_MSG_SEND_BURST = getattr(MODE, "UART_MSG_SEND_BURST")
+except AttributeError:
+	UART_MSG_SEND_BURST = 0x13
+
+# Trigger mode selection messages for internal vs external triggers.
+try:
+	UART_MSG_TRIG_INTERNAL = getattr(MODE, "UART_MSG_TRIG_INTERNAL")
+except AttributeError:
+	UART_MSG_TRIG_INTERNAL = 0x14
+
+try:
+	UART_MSG_TRIG_EXTERNAL = getattr(MODE, "UART_MSG_TRIG_EXTERNAL")
+except AttributeError:
+	UART_MSG_TRIG_EXTERNAL = 0x15
+
 class UART_COMMS:
 	"""Encapsulated UART communications using the framed protocol.
 
@@ -202,6 +237,10 @@ class UART_COMMS:
 				MODE.UART_MSG_GET_PARAMS,
 				MODE.UART_MSG_UPDATE_WIDTH,
 				MODE.UART_MSG_UPDATE_AMP,
+				UART_MSG_UPDATE_FREQ,
+				UART_MSG_UPDATE_BURST,
+				UART_MSG_TRIG_INTERNAL,
+				UART_MSG_TRIG_EXTERNAL,
 			):
 				try:
 					self._events.put({"type": "receipt", "msg_type": msg_type})
@@ -244,6 +283,30 @@ class UART_COMMS:
 						amp = struct.unpack('>f', bytes(payload[:4]))[0]
 					if amp is not None:
 						self._events.put({"type": "send_amp", "amp": float(amp)})
+				except Exception:
+					pass
+			elif msg_type == UART_MSG_SEND_FREQ:
+				try:
+					freq = None
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+						freq = int.from_bytes(payload, byteorder="big", signed=True)
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+						b = bytes(payload[:4]).ljust(4, b"\x00")
+						freq = int.from_bytes(b, byteorder="big", signed=True)
+					if freq is not None:
+						self._events.put({"type": "send_freq", "freq": freq})
+				except Exception:
+					pass
+			elif msg_type == UART_MSG_SEND_BURST:
+				try:
+					burst = None
+					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+						burst = int.from_bytes(payload, byteorder="big", signed=True)
+					elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+						b = bytes(payload[:4]).ljust(4, b"\x00")
+						burst = int.from_bytes(b, byteorder="big", signed=True)
+					if burst is not None:
+						self._events.put({"type": "send_burst", "burst": burst})
 				except Exception:
 					pass
 
@@ -330,6 +393,31 @@ class UART_COMMS:
 
 	def set_stim_amplitude(self, amplitude):
 		self._send_packet(MODE.UART_MSG_UPDATE_AMP, float(amplitude), PAYLOAD_TYPE.PAYLOAD_FLOAT32)
+
+	def set_stim_frequency(self, frequency_hz):
+		"""Send stimulation frequency (Hz) as an INT32 payload to the control board."""
+		self._send_packet(UART_MSG_UPDATE_FREQ, int(frequency_hz), PAYLOAD_TYPE.PAYLOAD_INT32)
+
+	def set_burst_length(self, burst_length_us):
+		"""Send burst length (microseconds) as an INT32 payload to the control board."""
+		self._send_packet(UART_MSG_UPDATE_BURST, int(burst_length_us), PAYLOAD_TYPE.PAYLOAD_INT32)
+
+	def set_trigger_mode(self, internal: bool | int):
+		"""Select trigger source mode on the stim board via the control board.
+
+		When `internal` is True or 0, internal triggers are enabled;
+		otherwise external triggers are selected, disabling internal pulses.
+		"""
+		is_internal = False
+		try:
+			if isinstance(internal, bool):
+				is_internal = internal
+			else:
+				is_internal = (int(internal) == 0)
+		except Exception:
+			is_internal = True
+		msg_type = UART_MSG_TRIG_INTERNAL if is_internal else UART_MSG_TRIG_EXTERNAL
+		self._send_packet(msg_type)
 
 	def set_pulse_width(self, width):
 		self._send_packet(MODE.UART_MSG_UPDATE_WIDTH, int(width), PAYLOAD_TYPE.PAYLOAD_INT32)
