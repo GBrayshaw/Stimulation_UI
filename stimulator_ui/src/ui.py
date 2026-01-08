@@ -17,8 +17,12 @@ class AppUI:
         # UI Display variables
         self.stim_amplitude = 0.00
         self.pulse_width = 0.00
+        self.stim_frequency = 0.00
+        self.burst_length = 0.00
         self.pending_stim_amplitude = 0.00
         self.pending_pulse_width = 0.00
+        self.pending_stim_frequency = 0.00
+        self.pending_burst_length = 0.00
         self.nerve_impedance = 0.00
         # Runtime state flags for control logic
         self.interlocks_on = None  # True when engaged; False when disengaged; None unknown
@@ -46,7 +50,7 @@ class AppUI:
         # self.nerve_impedance_label = Label(master, textvariable=self.nerve_impedance_var)
         # self.nerve_impedance_label.grid(row=2, column=2, padx=10, pady=10)
 
-        # UI Buttons
+        # UI Buttons for amplitude and pulse width
         self.stim_up_but = Button(master, text="+", command=self.stim_amp_up, width=10, height=2, state=DISABLED)
         self.stim_up_but.grid(row=1, column=0, padx=10, pady=10)
 
@@ -59,32 +63,7 @@ class AppUI:
         self.pulse_down_but = Button(master, text="-", command=self.pulse_width_down, width=10, height=2, state=DISABLED)
         self.pulse_down_but.grid(row=3, column=1, padx=10, pady=10)
 
-        self.done_but = Button(master, text="Set Parameters", command=self.apply_settings, width=10, height=2)
-        self.done_but.grid(row=4, column=0, columnspan=2, padx=10, pady=10)
-
-        # Control actions: START above STOP in a stacked frame
-        self.ctrl_actions = Frame(master)
-        self.ctrl_actions.grid(row=4, column=2, padx=10, pady=10, sticky="n")
-        self.start_but = Button(self.ctrl_actions, text="Unlock Interlocks", command=self.start_system, width=16, height=2, state=DISABLED)
-        self.start_but.pack(padx=5, pady=(0,5))
-        self.start_stim_but = Button(self.ctrl_actions, text="Start Stim", command=self.start_stim, width=12, height=2, state=DISABLED)
-        self.start_stim_but.pack(padx=5, pady=5)
-        self.STOP_but = Button(self.ctrl_actions, text="STOP", command=self.STOP, width=10, height=2, state=DISABLED)
-        self.STOP_but.pack(padx=5, pady=(5,0))
-
-        # Reconnect button
-        self.reconnect_but = Button(master, text="Reconnect", command=self.start_auto_connect, state=NORMAL)
-        self.reconnect_but.grid(row=6, column=2, rowspan=3, padx=10, pady=10)
-
-        # Reconnect User Board button
-        # self.reconnect_user_but = Button(master, text="Reconnect User Board", command=self.initialise_user_board, state=DISABLED)
-        # self.reconnect_user_but.grid(row=7, column=2, rowspan=3, padx=10, pady=10)
-
-        # Poll Status button
-        self.poll_status_but = Button(master, text="Get Parameters", command=self.poll_status, width=10, height=2, state=DISABLED)
-        self.poll_status_but.grid(row=9, column=2, padx=10, pady=10)
-
-        # Entry boxes for manual input
+        # Parameter entry boxes (left side)
         self.stim_amplitude_entry = Entry(master, state=DISABLED)
         self.stim_amplitude_entry.grid(row=1, column=2, padx=10, pady=10)
         self.stim_amplitude_entry.bind("<Return>", self.update_stim_amplitude)
@@ -93,47 +72,104 @@ class AppUI:
         self.pulse_width_entry.grid(row=3, column=2, padx=10, pady=10)
         self.pulse_width_entry.bind("<Return>", self.update_pulse_width)
 
-        # Trigger source selection (Internal vs External), using explicit radio buttons
-        self.triggers_label = Label(master, text="Triggers")
-        self.triggers_label.grid(row=5, column=0, columnspan=2, padx=10, pady=(10, 0))
+        # Additional stimulation parameters: frequency and burst length
+        self.stim_freq_label = Label(master, text="Stim Frequency (Hz)")
+        # Align header with Stim Amplitude / Pulse Width headers
+        self.stim_freq_label.grid(row=4, column=0, columnspan=2, padx=10, pady=(10, 0))
+        self.stim_freq_entry = Entry(master, state=DISABLED)
+        # Align box with Stim Amplitude / Pulse Width boxes (entry column)
+        self.stim_freq_entry.grid(row=5, column=2, padx=10, pady=5)
+        # Up/down controls for stimulation frequency
+        self.stim_freq_up_but = Button(master, text="+", command=self.stim_freq_up, width=10, height=2, state=DISABLED)
+        self.stim_freq_up_but.grid(row=5, column=0, padx=10, pady=5)
+        self.stim_freq_down_but = Button(master, text="-", command=self.stim_freq_down, width=10, height=2, state=DISABLED)
+        self.stim_freq_down_but.grid(row=5, column=1, padx=10, pady=5)
+        self.stim_freq_entry.bind("<Return>", self.update_stim_freq)
 
-        self.trigger_mode_var = IntVar()
-        self.trigger_mode_var.set(0)  # 0 = Internal, 1 = External
-        self.trigger_internal_radio = Radiobutton(master, text="Internal", variable=self.trigger_mode_var, value=0,
-                              command=self.toggle_trigger, state=DISABLED)
-        self.trigger_internal_radio.grid(row=6, column=0, padx=10, pady=2, sticky="w")
-        self.trigger_external_radio = Radiobutton(master, text="External", variable=self.trigger_mode_var, value=1,
-                              command=self.toggle_trigger, state=DISABLED)
-        self.trigger_external_radio.grid(row=6, column=1, padx=10, pady=2, sticky="w")
+        self.burst_len_label = Label(master, text="Burst Length (us)")
+        # Align header with Stim Amplitude / Pulse Width headers
+        self.burst_len_label.grid(row=6, column=0, columnspan=2, padx=10, pady=(10, 0))
+        self.burst_len_entry = Entry(master, state=DISABLED)
+        # Align box with Stim Amplitude / Pulse Width boxes (entry column)
+        self.burst_len_entry.grid(row=7, column=2, padx=10, pady=5)
+        # Up/down controls for burst length
+        self.burst_len_up_but = Button(master, text="+", command=self.burst_len_up, width=10, height=2, state=DISABLED)
+        self.burst_len_up_but.grid(row=7, column=0, padx=10, pady=5)
+        self.burst_len_down_but = Button(master, text="-", command=self.burst_len_down, width=10, height=2, state=DISABLED)
+        self.burst_len_down_but.grid(row=7, column=1, padx=10, pady=5)
+        self.burst_len_entry.bind("<Return>", self.update_burst_len)
 
-        # Mode selection: Recording vs Stimulation (more visually distinctive than a single checkbox)
-        self.mode_label = Label(master, text="Mode")
-        self.mode_label.grid(row=7, column=0, columnspan=2, padx=10, pady=(10, 0))
+        # Parameter actions below all parameter boxes
+        self.done_but = Button(master, text="Set Parameters", command=self.apply_settings, width=12, height=2)
+        self.done_but.grid(row=8, column=0, padx=10, pady=10, sticky="e")
 
+        self.poll_status_but = Button(master, text="Get Parameters", command=self.poll_status, width=12, height=2, state=DISABLED)
+        self.poll_status_but.grid(row=8, column=1, padx=10, pady=10, sticky="w")
+
+        # Right-hand control panel: mode, actions, switches, and debug toggle
+        self.right_panel = Frame(master)
+        self.right_panel.grid(row=0, column=3, rowspan=12, padx=10, pady=10, sticky="n")
+
+        # Mode selection: Recording vs Stimulation
         self.mode_var = IntVar()
         self.mode_var.set(0)  # 0 = Recording, 1 = Stimulation
-        self.mode_record_radio = Radiobutton(master, text="Recording", variable=self.mode_var, value=0,
-                             command=self.toggle_recording, state=DISABLED)
-        self.mode_record_radio.grid(row=8, column=0, padx=10, pady=2, sticky="w")
-        self.mode_stim_radio = Radiobutton(master, text="Stimulation", variable=self.mode_var, value=1,
-                           command=self.toggle_recording, state=DISABLED)
-        self.mode_stim_radio.grid(row=8, column=1, padx=10, pady=2, sticky="w")
+        self.mode_label = Label(self.right_panel, text="Mode")
+        self.mode_label.pack(anchor="center", padx=5, pady=(0, 2))
+        self.mode_record_radio = Radiobutton(self.right_panel, text="Recording", variable=self.mode_var, value=0,
+                 command=self.toggle_recording, state=DISABLED)
+        self.mode_record_radio.pack(anchor="center", padx=10, pady=1)
+        self.mode_stim_radio = Radiobutton(self.right_panel, text="Stimulation", variable=self.mode_var, value=1,
+               command=self.toggle_recording, state=DISABLED)
+        self.mode_stim_radio.pack(anchor="center", padx=10, pady=1)
 
-        # PC vs User control selection, using explicit radio buttons
+        # Trigger source selection (Internal vs External), under Mode
+        self.trigger_mode_var = IntVar()
+        self.trigger_mode_var.set(0)  # 0 = Internal, 1 = External
+        self.triggers_label = Label(self.right_panel, text="Triggers")
+        self.triggers_label.pack(anchor="center", padx=5, pady=(8, 0))
+        self.trigger_internal_radio = Radiobutton(self.right_panel, text="Internal", variable=self.trigger_mode_var, value=0,
+                  command=self.toggle_trigger, state=DISABLED)
+        self.trigger_internal_radio.pack(anchor="center", padx=10, pady=1)
+        self.trigger_external_radio = Radiobutton(self.right_panel, text="External", variable=self.trigger_mode_var, value=1,
+                  command=self.toggle_trigger, state=DISABLED)
+        self.trigger_external_radio.pack(anchor="center", padx=10, pady=1)
+
+        # Control actions stacked vertically
+        self.start_but = Button(self.right_panel, text="Unlock Interlocks", command=self.start_system,
+                width=16, height=2, state=DISABLED)
+        self.start_but.pack(padx=5, pady=(12, 4))
+        self.start_stim_but = Button(self.right_panel, text="Start Stim", command=self.start_stim,
+                 width=12, height=2, state=DISABLED)
+        self.start_stim_but.pack(padx=5, pady=4)
+        self.STOP_but = Button(self.right_panel, text="STOP", command=self.STOP,
+                   width=10, height=2, state=DISABLED)
+        self.STOP_but.pack(padx=5, pady=4)
+        self.reconnect_but = Button(self.right_panel, text="Reconnect", command=self.start_auto_connect, state=NORMAL)
+        self.reconnect_but.pack(padx=5, pady=(4, 10))
+
+        # PC vs User control selection, on right-hand side
         self.pc_user_mode_var = IntVar()
         self.pc_user_mode_var.set(0)  # 0 = User, 1 = PC
-        self.pc_user_label = Label(master, text="Control")
-        self.pc_user_label.grid(row=9, column=0, columnspan=2, padx=10, pady=(10, 0))
-        self.pc_mode_user_radio = Radiobutton(master, text="Manual", variable=self.pc_user_mode_var, value=0,
-                              command=self.toggle_pc_user, state=DISABLED)
-        self.pc_mode_user_radio.grid(row=10, column=0, padx=10, pady=2, sticky="w")
-        self.pc_mode_pc_radio = Radiobutton(master, text="Tablet", variable=self.pc_user_mode_var, value=1,
-                            command=self.toggle_pc_user, state=DISABLED)
-        self.pc_mode_pc_radio.grid(row=10, column=1, padx=10, pady=2, sticky="w")
+        self.pc_user_label = Label(self.right_panel, text="Control")
+        self.pc_user_label.pack(anchor="center", padx=5, pady=(8, 0))
+        self.pc_mode_user_radio = Radiobutton(self.right_panel, text="Manual", variable=self.pc_user_mode_var, value=0,
+                      command=self.toggle_pc_user, state=DISABLED)
+        self.pc_mode_user_radio.pack(anchor="center", padx=10, pady=1)
+        self.pc_mode_pc_radio = Radiobutton(self.right_panel, text="Tablet", variable=self.pc_user_mode_var, value=1,
+                    command=self.toggle_pc_user, state=DISABLED)
+        self.pc_mode_pc_radio.pack(anchor="center", padx=10, pady=1)
 
-        # Event log
-        self.event_log = Text(master, width=80, height=20)
-        self.event_log.grid(row=0, column=3, rowspan=14, padx=10, pady=10)
+        # Show/hide debug log toggle (place below log box, bottom-left)
+        self.show_debug_var = IntVar()
+        self.show_debug_var.set(1)
+        # Event log on right-hand side
+        self.event_log = Text(master, width=60, height=20)
+        self.event_log.grid(row=1, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
+        # Place Show Debug under the log box, bottom-left corner
+        self.show_debug_check = Checkbutton(master, text="Show Debug",
+                    variable=self.show_debug_var,
+                    command=self.toggle_debug)
+        self.show_debug_check.grid(row=14, column=4, padx=10, pady=(0, 10), sticky="w")
 
         # Shutdown button (upper-right)
         self.shutdown_but = Button(master, text="Shutdown", command=self.shutdown_system, width=12, height=2)
@@ -565,6 +601,16 @@ class AppUI:
         self.event_log.insert(END, f"{timestamp} - {event}\n")
         self.event_log.see(END)
 
+    def toggle_debug(self):
+        """Show or hide the debug log panel based on the Show Debug toggle."""
+        try:
+            if self.show_debug_var.get():
+                self.event_log.grid(row=1, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
+            else:
+                self.event_log.grid_remove()
+        except Exception:
+            pass
+
     def stim_amp_up(self):
         self.pending_stim_amplitude += 1.00
         self.stim_amplitude_var.set(f"Stim Amplitude: {self.pending_stim_amplitude:.2f}uA")
@@ -582,6 +628,46 @@ class AppUI:
         if self.pending_pulse_width < 0:
             self.pending_pulse_width = 0
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+
+    def stim_freq_up(self):
+        """Increase pending stimulation frequency and update entry."""
+        self.pending_stim_frequency += 1.00
+        try:
+            self.stim_freq_entry.delete(0, END)
+            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+        except Exception:
+            pass
+
+    def stim_freq_down(self):
+        """Decrease pending stimulation frequency and update entry."""
+        self.pending_stim_frequency -= 1.00
+        if self.pending_stim_frequency < 0:
+            self.pending_stim_frequency = 0
+        try:
+            self.stim_freq_entry.delete(0, END)
+            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+        except Exception:
+            pass
+
+    def burst_len_up(self):
+        """Increase pending burst length and update entry."""
+        self.pending_burst_length += 1.00
+        try:
+            self.burst_len_entry.delete(0, END)
+            self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
+        except Exception:
+            pass
+
+    def burst_len_down(self):
+        """Decrease pending burst length and update entry."""
+        self.pending_burst_length -= 1.00
+        if self.pending_burst_length < 0:
+            self.pending_burst_length = 0
+        try:
+            self.burst_len_entry.delete(0, END)
+            self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
+        except Exception:
+            pass
 
     def apply_settings(self):
         """Apply the pending stimulation amplitude and pulse width settings."""
@@ -676,8 +762,14 @@ class AppUI:
         self.stim_down_but.config(state=DISABLED)
         self.pulse_up_but.config(state=DISABLED)
         self.pulse_down_but.config(state=DISABLED)
+        self.stim_freq_up_but.config(state=DISABLED)
+        self.stim_freq_down_but.config(state=DISABLED)
+        self.burst_len_up_but.config(state=DISABLED)
+        self.burst_len_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
+        self.stim_freq_entry.config(state=DISABLED)
+        self.burst_len_entry.config(state=DISABLED)
         try:
             self.trigger_internal_radio.config(state=DISABLED)
             self.trigger_external_radio.config(state=DISABLED)
@@ -700,8 +792,14 @@ class AppUI:
         self.stim_down_but.config(state=NORMAL)
         self.pulse_up_but.config(state=NORMAL)
         self.pulse_down_but.config(state=NORMAL)
+        self.stim_freq_up_but.config(state=NORMAL)
+        self.stim_freq_down_but.config(state=NORMAL)
+        self.burst_len_up_but.config(state=NORMAL)
+        self.burst_len_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
+        self.stim_freq_entry.config(state=NORMAL)
+        self.burst_len_entry.config(state=NORMAL)
         try:
             self.trigger_internal_radio.config(state=NORMAL)
             self.trigger_external_radio.config(state=NORMAL)
@@ -726,8 +824,14 @@ class AppUI:
         self.stim_down_but.config(state=DISABLED)
         self.pulse_up_but.config(state=DISABLED)
         self.pulse_down_but.config(state=DISABLED)
+        self.stim_freq_up_but.config(state=DISABLED)
+        self.stim_freq_down_but.config(state=DISABLED)
+        self.burst_len_up_but.config(state=DISABLED)
+        self.burst_len_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
+        self.stim_freq_entry.config(state=DISABLED)
+        self.burst_len_entry.config(state=DISABLED)
         try:
             self.trigger_internal_radio.config(state=DISABLED)
             self.trigger_external_radio.config(state=DISABLED)
@@ -743,8 +847,14 @@ class AppUI:
         self.stim_down_but.config(state=NORMAL)
         self.pulse_up_but.config(state=NORMAL)
         self.pulse_down_but.config(state=NORMAL)
+        self.stim_freq_up_but.config(state=NORMAL)
+        self.stim_freq_down_but.config(state=NORMAL)
+        self.burst_len_up_but.config(state=NORMAL)
+        self.burst_len_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
+        self.stim_freq_entry.config(state=NORMAL)
+        self.burst_len_entry.config(state=NORMAL)
         try:
             self.trigger_internal_radio.config(state=NORMAL)
             self.trigger_external_radio.config(state=NORMAL)
@@ -772,13 +882,35 @@ class AppUI:
         except ValueError:
             self.log_event("Invalid input for Pulse Width")
 
+    def update_stim_freq(self, event):
+        """Update the pending stimulation frequency from the entry box."""
+        try:
+            value = float(self.stim_freq_entry.get())
+            self.pending_stim_frequency = value
+        except ValueError:
+            self.log_event("Invalid input for Stim Frequency")
+
+    def update_burst_len(self, event):
+        """Update the pending burst length from the entry box."""
+        try:
+            value = float(self.burst_len_entry.get())
+            self.pending_burst_length = value
+        except ValueError:
+            self.log_event("Invalid input for Burst Length")
+
     def disable_ui(self):
         self.stim_up_but.config(state=DISABLED)
         self.stim_down_but.config(state=DISABLED)
         self.pulse_up_but.config(state=DISABLED)
         self.pulse_down_but.config(state=DISABLED)
+        self.stim_freq_up_but.config(state=DISABLED)
+        self.stim_freq_down_but.config(state=DISABLED)
+        self.burst_len_up_but.config(state=DISABLED)
+        self.burst_len_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
+        self.stim_freq_entry.config(state=DISABLED)
+        self.burst_len_entry.config(state=DISABLED)
         try:
             self.trigger_internal_radio.config(state=DISABLED)
             self.trigger_external_radio.config(state=DISABLED)
@@ -800,8 +932,14 @@ class AppUI:
         self.stim_down_but.config(state=DISABLED)
         self.pulse_up_but.config(state=DISABLED)
         self.pulse_down_but.config(state=DISABLED)
+        self.stim_freq_up_but.config(state=DISABLED)
+        self.stim_freq_down_but.config(state=DISABLED)
+        self.burst_len_up_but.config(state=DISABLED)
+        self.burst_len_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
+        self.stim_freq_entry.config(state=DISABLED)
+        self.burst_len_entry.config(state=DISABLED)
         try:
             self.trigger_internal_radio.config(state=DISABLED)
             self.trigger_external_radio.config(state=DISABLED)
@@ -826,8 +964,14 @@ class AppUI:
         self.stim_down_but.config(state=NORMAL)
         self.pulse_up_but.config(state=NORMAL)
         self.pulse_down_but.config(state=NORMAL)
+        self.stim_freq_up_but.config(state=NORMAL)
+        self.stim_freq_down_but.config(state=NORMAL)
+        self.burst_len_up_but.config(state=NORMAL)
+        self.burst_len_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
+        self.stim_freq_entry.config(state=NORMAL)
+        self.burst_len_entry.config(state=NORMAL)
         try:
             self.trigger_internal_radio.config(state=NORMAL)
             self.trigger_external_radio.config(state=NORMAL)
@@ -980,8 +1124,14 @@ class AppUI:
         self.stim_down_but.config(state=NORMAL)
         self.pulse_up_but.config(state=NORMAL)
         self.pulse_down_but.config(state=NORMAL)
+        self.stim_freq_up_but.config(state=NORMAL)
+        self.stim_freq_down_but.config(state=NORMAL)
+        self.burst_len_up_but.config(state=NORMAL)
+        self.burst_len_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
+        self.stim_freq_entry.config(state=NORMAL)
+        self.burst_len_entry.config(state=NORMAL)
         try:
             self.trigger_internal_radio.config(state=NORMAL)
             self.trigger_external_radio.config(state=NORMAL)
