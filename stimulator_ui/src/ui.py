@@ -73,7 +73,10 @@ class AppUI:
         self.pulse_width_entry.bind("<Return>", self.update_pulse_width)
 
         # Additional stimulation parameters: frequency and burst length
-        self.stim_freq_label = Label(master, text="Stim Frequency (Hz)")
+        # Display indicator for current/desired stim frequency
+        self.stim_freq_var = StringVar()
+        self.stim_freq_var.set("Stim Frequency: — Hz")
+        self.stim_freq_label = Label(master, textvariable=self.stim_freq_var)
         # Align header with Stim Amplitude / Pulse Width headers
         self.stim_freq_label.grid(row=4, column=0, columnspan=2, padx=10, pady=(10, 0))
         self.stim_freq_entry = Entry(master, state=DISABLED)
@@ -86,7 +89,10 @@ class AppUI:
         self.stim_freq_down_but.grid(row=5, column=1, padx=10, pady=5)
         self.stim_freq_entry.bind("<Return>", self.update_stim_freq)
 
-        self.burst_len_label = Label(master, text="Burst Length (us)")
+        # Display indicator for current/desired burst length
+        self.burst_len_var = StringVar()
+        self.burst_len_var.set("Burst Length: — us")
+        self.burst_len_label = Label(master, textvariable=self.burst_len_var)
         # Align header with Stim Amplitude / Pulse Width headers
         self.burst_len_label.grid(row=6, column=0, columnspan=2, padx=10, pady=(10, 0))
         self.burst_len_entry = Entry(master, state=DISABLED)
@@ -373,6 +379,12 @@ class AppUI:
             try:
                 self.stim_amplitude_var.set("Stim Amplitude: — uA")
                 self.pulse_width_var.set("Pulse Width: —")
+                # Also reset frequency and burst indicators
+                try:
+                    self.stim_freq_var.set("Stim Frequency: — Hz")
+                    self.burst_len_var.set("Burst Length: — us")
+                except Exception:
+                    pass
             except Exception:
                 pass
             self.disable_uart_controls()
@@ -443,6 +455,10 @@ class AppUI:
                             label = "Control Receipt: Update Width"
                         elif mt == getattr(M, 'UART_MSG_UPDATE_AMP', None):
                             label = "Control Receipt: Update Amplitude"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_FREQ', None):
+                            label = "Control Receipt: Update Frequency"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_BURST', None):
+                            label = "Control Receipt: Update Burst Length"
                         elif mt == getattr(M, 'UART_MSG_SHUTDOWN', None):
                             label = "Control Receipt: Shutdown"
                     except Exception:
@@ -574,6 +590,46 @@ class AppUI:
                             self.log_event(f"Control board amplitude updated: {self.stim_amplitude:.2f}uA")
                         except Exception:
                             pass
+
+                elif ev.get("type") == "send_freq":
+                    freq = ev.get("freq")
+                    if freq is not None:
+                        try:
+                            # Frequency is transported as INT32 Hz
+                            self.stim_frequency = int(freq)
+                            self.pending_stim_frequency = float(self.stim_frequency)
+                            try:
+                                self.stim_freq_entry.delete(0, END)
+                                self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+                            except Exception:
+                                pass
+                            try:
+                                self.stim_freq_var.set(f"Stim Frequency: {self.stim_frequency} Hz")
+                            except Exception:
+                                pass
+                            self.log_event(f"Control board frequency updated: {self.stim_frequency} Hz")
+                        except Exception:
+                            pass
+
+                elif ev.get("type") == "send_burst":
+                    burst = ev.get("burst")
+                    if burst is not None:
+                        try:
+                            # Burst length is transported as INT32 microseconds
+                            self.burst_length = int(burst)
+                            self.pending_burst_length = float(self.burst_length)
+                            try:
+                                self.burst_len_entry.delete(0, END)
+                                self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
+                            except Exception:
+                                pass
+                            try:
+                                self.burst_len_var.set(f"Burst Length: {self.burst_length} us")
+                            except Exception:
+                                pass
+                            self.log_event(f"Control board burst length updated: {self.burst_length} us")
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -630,16 +686,20 @@ class AppUI:
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
 
     def stim_freq_up(self):
-        """Increase pending stimulation frequency and update entry."""
+        """Increase pending stimulation frequency and update indicator/entry."""
         self.pending_stim_frequency += 1.00
         try:
             self.stim_freq_entry.delete(0, END)
             self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
         except Exception:
             pass
+        try:
+            self.stim_freq_var.set(f"Stim Frequency: {self.pending_stim_frequency:.2f} Hz")
+        except Exception:
+            pass
 
     def stim_freq_down(self):
-        """Decrease pending stimulation frequency and update entry."""
+        """Decrease pending stimulation frequency and update indicator/entry."""
         self.pending_stim_frequency -= 1.00
         if self.pending_stim_frequency < 0:
             self.pending_stim_frequency = 0
@@ -648,18 +708,26 @@ class AppUI:
             self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
         except Exception:
             pass
+        try:
+            self.stim_freq_var.set(f"Stim Frequency: {self.pending_stim_frequency:.2f} Hz")
+        except Exception:
+            pass
 
     def burst_len_up(self):
-        """Increase pending burst length and update entry."""
+        """Increase pending burst length and update indicator/entry."""
         self.pending_burst_length += 1.00
         try:
             self.burst_len_entry.delete(0, END)
             self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
         except Exception:
             pass
+        try:
+            self.burst_len_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
+        except Exception:
+            pass
 
     def burst_len_down(self):
-        """Decrease pending burst length and update entry."""
+        """Decrease pending burst length and update indicator/entry."""
         self.pending_burst_length -= 1.00
         if self.pending_burst_length < 0:
             self.pending_burst_length = 0
@@ -668,19 +736,52 @@ class AppUI:
             self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
         except Exception:
             pass
+        try:
+            self.burst_len_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
+        except Exception:
+            pass
 
     def apply_settings(self):
-        """Apply the pending stimulation amplitude and pulse width settings."""
+        """Apply the pending stimulation settings (amplitude, width, freq, burst).
+
+        Frequency and burst length are normalised to INT32 values before
+        being sent to the control board so that all parameters on the wire
+        are integer or float32 scalars as defined by the protocol.
+        """
         self.stim_amplitude = self.pending_stim_amplitude
         self.pulse_width = self.pending_pulse_width
-        self.log_event(f"Applied settings: Stim Amplitude = {self.stim_amplitude:.2f}uA, Pulse Width = {self.pulse_width:.2f}")
+        # Normalise frequency and burst length to integer values for transport
+        try:
+            self.stim_frequency = int(self.pending_stim_frequency)
+        except Exception:
+            self.stim_frequency = 0
+        try:
+            self.burst_length = int(self.pending_burst_length)
+        except Exception:
+            self.burst_length = 0
+
+        # Update on-screen indicators to reflect committed values
+        try:
+            self.stim_freq_var.set(f"Stim Frequency: {self.stim_frequency} Hz")
+            self.burst_len_var.set(f"Burst Length: {self.burst_length} us")
+        except Exception:
+            pass
+
+        self.log_event(
+            f"Applied settings: Stim Amplitude = {self.stim_amplitude:.2f}uA, "
+            f"Pulse Width = {self.pulse_width:.2f}, Freq = {self.stim_frequency} Hz, "
+            f"Burst = {self.burst_length} us"
+        )
         if not self.control_uart:
             self.log_event("Cannot apply settings: control board not connected.")
             return
         try:
-            # Send width (int) and amplitude (float) to control board
+            # Send width (int), amplitude (float), frequency (int), and burst (int)
+            # to the control board. Frequency and burst are sent as INT32 payloads.
             self.control_uart.set_pulse_width(self.pulse_width)
             self.control_uart.set_stim_amplitude(self.stim_amplitude)
+            self.control_uart.set_stim_frequency(self.stim_frequency)
+            self.control_uart.set_burst_length(self.burst_length)
             self.log_event("Settings sent to control board.")
         except Exception as e:
             self.log_event(f"Failed to send settings: {e}")
@@ -887,6 +988,10 @@ class AppUI:
         try:
             value = float(self.stim_freq_entry.get())
             self.pending_stim_frequency = value
+            try:
+                self.stim_freq_var.set(f"Stim Frequency: {self.pending_stim_frequency:.2f} Hz")
+            except Exception:
+                pass
         except ValueError:
             self.log_event("Invalid input for Stim Frequency")
 
@@ -895,6 +1000,10 @@ class AppUI:
         try:
             value = float(self.burst_len_entry.get())
             self.pending_burst_length = value
+            try:
+                self.burst_len_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
+            except Exception:
+                pass
         except ValueError:
             self.log_event("Invalid input for Burst Length")
 
