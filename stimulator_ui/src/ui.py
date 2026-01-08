@@ -41,10 +41,10 @@ class AppUI:
         self.pulse_width_label = Label(master, textvariable=self.pulse_width_var)
         self.pulse_width_label.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
 
-        self.nerve_impedance_var = StringVar()
-        self.nerve_impedance_var.set(f"Nerve Impedance: {self.nerve_impedance:.2f}ohms")
-        self.nerve_impedance_label = Label(master, textvariable=self.nerve_impedance_var)
-        self.nerve_impedance_label.grid(row=2, column=2, padx=10, pady=10)
+        # self.nerve_impedance_var = StringVar()
+        # self.nerve_impedance_var.set(f"Nerve Impedance: {self.nerve_impedance:.2f}ohms")
+        # self.nerve_impedance_label = Label(master, textvariable=self.nerve_impedance_var)
+        # self.nerve_impedance_label.grid(row=2, column=2, padx=10, pady=10)
 
         # UI Buttons
         self.stim_up_but = Button(master, text="+", command=self.stim_amp_up, width=10, height=2, state=DISABLED)
@@ -59,7 +59,7 @@ class AppUI:
         self.pulse_down_but = Button(master, text="-", command=self.pulse_width_down, width=10, height=2, state=DISABLED)
         self.pulse_down_but.grid(row=3, column=1, padx=10, pady=10)
 
-        self.done_but = Button(master, text="Done", command=self.apply_settings, width=10, height=2)
+        self.done_but = Button(master, text="Set Parameters", command=self.apply_settings, width=10, height=2)
         self.done_but.grid(row=4, column=0, columnspan=2, padx=10, pady=10)
 
         # Control actions: START above STOP in a stacked frame
@@ -81,7 +81,7 @@ class AppUI:
         # self.reconnect_user_but.grid(row=7, column=2, rowspan=3, padx=10, pady=10)
 
         # Poll Status button
-        self.poll_status_but = Button(master, text="Poll Status", command=self.poll_status, width=10, height=2, state=DISABLED)
+        self.poll_status_but = Button(master, text="Get Parameters", command=self.poll_status, width=10, height=2, state=DISABLED)
         self.poll_status_but.grid(row=9, column=2, padx=10, pady=10)
 
         # Entry boxes for manual input
@@ -94,7 +94,7 @@ class AppUI:
         self.pulse_width_entry.bind("<Return>", self.update_pulse_width)
 
         # Trigger source selection (Internal vs External), using explicit radio buttons
-        self.triggers_label = Label(master, text="Triggers (Internal / External)")
+        self.triggers_label = Label(master, text="Triggers")
         self.triggers_label.grid(row=5, column=0, columnspan=2, padx=10, pady=(10, 0))
 
         self.trigger_mode_var = IntVar()
@@ -107,7 +107,7 @@ class AppUI:
         self.trigger_external_radio.grid(row=6, column=1, padx=10, pady=2, sticky="w")
 
         # Mode selection: Recording vs Stimulation (more visually distinctive than a single checkbox)
-        self.mode_label = Label(master, text="Mode (Recording / Stimulation)")
+        self.mode_label = Label(master, text="Mode")
         self.mode_label.grid(row=7, column=0, columnspan=2, padx=10, pady=(10, 0))
 
         self.mode_var = IntVar()
@@ -122,12 +122,12 @@ class AppUI:
         # PC vs User control selection, using explicit radio buttons
         self.pc_user_mode_var = IntVar()
         self.pc_user_mode_var.set(0)  # 0 = User, 1 = PC
-        self.pc_user_label = Label(master, text="Control (User / PC)")
+        self.pc_user_label = Label(master, text="Control")
         self.pc_user_label.grid(row=9, column=0, columnspan=2, padx=10, pady=(10, 0))
-        self.pc_mode_user_radio = Radiobutton(master, text="User", variable=self.pc_user_mode_var, value=0,
+        self.pc_mode_user_radio = Radiobutton(master, text="Manual", variable=self.pc_user_mode_var, value=0,
                               command=self.toggle_pc_user, state=DISABLED)
         self.pc_mode_user_radio.grid(row=10, column=0, padx=10, pady=2, sticky="w")
-        self.pc_mode_pc_radio = Radiobutton(master, text="PC", variable=self.pc_user_mode_var, value=1,
+        self.pc_mode_pc_radio = Radiobutton(master, text="Tablet", variable=self.pc_user_mode_var, value=1,
                             command=self.toggle_pc_user, state=DISABLED)
         self.pc_mode_pc_radio.grid(row=10, column=1, padx=10, pady=2, sticky="w")
 
