@@ -26,7 +26,9 @@ class UART_COMMS:
 		self.baudrate = baudrate
 		self.comm_state = 1  # 0: User Mode, 1: PC Mode
 		self.record = True
-		self.heartbeat_f = HEARTBEAT_TIMEOUT_MS / 1000.0 * 2  # send at twice the timeout rate
+		# Heartbeat frequency: send at twice the timeout rate (2 / timeout_seconds)
+		# i.e. for HEARTBEAT_TIMEOUT_MS = 300 ms, heartbeat_f ≈ 6.67 Hz
+		self.heartbeat_f = 2000.0 / HEARTBEAT_TIMEOUT_MS
 		self.last_ctrl_heartbeat = 0.0
 		self.connected = False
 
@@ -174,6 +176,13 @@ class UART_COMMS:
 			self.last_ctrl_heartbeat = time.monotonic()
 			# Parse shutdown message and enqueue event with source
 			if msg_type == MODE.UART_MSG_SHUTDOWN:
+				# If no payload, treat as receipt echo of our request
+				if not payload or len(payload) == 0:
+					try:
+						self._events.put({"type": "receipt", "msg_type": MODE.UART_MSG_SHUTDOWN})
+					except Exception:
+						pass
+					continue
 				shutdown_src = None
 				try:
 					if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
@@ -184,6 +193,18 @@ class UART_COMMS:
 					shutdown_src = None
 				try:
 					self._events.put({"type": "shutdown", "source": shutdown_src})
+				except Exception:
+					pass
+			# Receipts for echoed control requests (exclude heartbeat)
+			elif msg_type in (
+				MODE.UART_MSG_UNLOCK,
+				MODE.UART_MSG_START_STIM,
+				MODE.UART_MSG_GET_PARAMS,
+				MODE.UART_MSG_UPDATE_WIDTH,
+				MODE.UART_MSG_UPDATE_AMP,
+			):
+				try:
+					self._events.put({"type": "receipt", "msg_type": msg_type})
 				except Exception:
 					pass
 			# Parse status reports and enqueue status code
@@ -276,6 +297,16 @@ class UART_COMMS:
 		else:
 			self._send_packet(MODE.UART_MSG_RECORD)
 			self.record = True
+
+	def set_mode_stim(self):
+		"""Explicitly set system mode to STIM on the control board."""
+		self._send_packet(MODE.UART_MSG_STIM)
+		self.record = False
+
+	def set_mode_record(self):
+		"""Explicitly set system mode to RECORD on the control board."""
+		self._send_packet(MODE.UART_MSG_RECORD)
+		self.record = True
 
 	def send_shutdown(self, source: int | None = None):
 		# Default to SHUTDOWN_SRC_PI when source not provided

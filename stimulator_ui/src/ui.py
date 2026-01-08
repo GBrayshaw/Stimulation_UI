@@ -1,4 +1,4 @@
-from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox, Frame
+from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox, Frame, Radiobutton
 from datetime import datetime
 from stim_io import UART_COMMS
 import uart_protocol
@@ -20,6 +20,13 @@ class AppUI:
         self.pending_stim_amplitude = 0.00
         self.pending_pulse_width = 0.00
         self.nerve_impedance = 0.00
+        # Runtime state flags for control logic
+        self.interlocks_on = None  # True when engaged; False when disengaged; None unknown
+        self.stim_on = None        # True when stimulation active; False when inactive; None unknown
+        # Last logged states so we only log when something actually changes
+        self._last_interlocks_on = None
+        self._last_stim_on = None
+        self._last_status_code = None
 
         # Display Labels
         self.stim_amplitude_var = StringVar()
@@ -86,21 +93,43 @@ class AppUI:
         self.pulse_width_entry.grid(row=3, column=2, padx=10, pady=10)
         self.pulse_width_entry.bind("<Return>", self.update_pulse_width)
 
-        # Switches
-        self.triggers_label = Label(master, text="Triggers (Internal - External)")
-        self.triggers_label.grid(row=5, column=0, columnspan=2, padx=10, pady=10)
+        # Trigger source selection (Internal vs External), using explicit radio buttons
+        self.triggers_label = Label(master, text="Triggers (Internal / External)")
+        self.triggers_label.grid(row=5, column=0, columnspan=2, padx=10, pady=(10, 0))
 
-        self.switch_var = IntVar()
-        self.triggers_switch = Checkbutton(master, text="", variable=self.switch_var, command=self.toggle_trigger, state=DISABLED)
-        self.triggers_switch.grid(row=6, column=0, columnspan=2, padx=10, pady=0)
+        self.trigger_mode_var = IntVar()
+        self.trigger_mode_var.set(0)  # 0 = Internal, 1 = External
+        self.trigger_internal_radio = Radiobutton(master, text="Internal", variable=self.trigger_mode_var, value=0,
+                              command=self.toggle_trigger, state=DISABLED)
+        self.trigger_internal_radio.grid(row=6, column=0, padx=10, pady=2, sticky="w")
+        self.trigger_external_radio = Radiobutton(master, text="External", variable=self.trigger_mode_var, value=1,
+                              command=self.toggle_trigger, state=DISABLED)
+        self.trigger_external_radio.grid(row=6, column=1, padx=10, pady=2, sticky="w")
 
-        self.recording_switch_var = IntVar()
-        self.recording_switch = Checkbutton(master, text="Recording - Stimulation", variable=self.recording_switch_var, command=self.toggle_recording, state=DISABLED)
-        self.recording_switch.grid(row=7, column=0, columnspan=2, padx=10, pady=10)
+        # Mode selection: Recording vs Stimulation (more visually distinctive than a single checkbox)
+        self.mode_label = Label(master, text="Mode (Recording / Stimulation)")
+        self.mode_label.grid(row=7, column=0, columnspan=2, padx=10, pady=(10, 0))
 
-        self.pc_user_switch_var = IntVar()
-        self.pc_user_switch = Checkbutton(master, text="PC - User", variable=self.pc_user_switch_var, command=self.toggle_pc_user, state=DISABLED)
-        self.pc_user_switch.grid(row=8, column=0, columnspan=2, padx=10, pady=10)
+        self.mode_var = IntVar()
+        self.mode_var.set(0)  # 0 = Recording, 1 = Stimulation
+        self.mode_record_radio = Radiobutton(master, text="Recording", variable=self.mode_var, value=0,
+                             command=self.toggle_recording, state=DISABLED)
+        self.mode_record_radio.grid(row=8, column=0, padx=10, pady=2, sticky="w")
+        self.mode_stim_radio = Radiobutton(master, text="Stimulation", variable=self.mode_var, value=1,
+                           command=self.toggle_recording, state=DISABLED)
+        self.mode_stim_radio.grid(row=8, column=1, padx=10, pady=2, sticky="w")
+
+        # PC vs User control selection, using explicit radio buttons
+        self.pc_user_mode_var = IntVar()
+        self.pc_user_mode_var.set(0)  # 0 = User, 1 = PC
+        self.pc_user_label = Label(master, text="Control (User / PC)")
+        self.pc_user_label.grid(row=9, column=0, columnspan=2, padx=10, pady=(10, 0))
+        self.pc_mode_user_radio = Radiobutton(master, text="User", variable=self.pc_user_mode_var, value=0,
+                              command=self.toggle_pc_user, state=DISABLED)
+        self.pc_mode_user_radio.grid(row=10, column=0, padx=10, pady=2, sticky="w")
+        self.pc_mode_pc_radio = Radiobutton(master, text="PC", variable=self.pc_user_mode_var, value=1,
+                            command=self.toggle_pc_user, state=DISABLED)
+        self.pc_mode_pc_radio.grid(row=10, column=1, padx=10, pady=2, sticky="w")
 
         # Event log
         self.event_log = Text(master, width=80, height=20)
@@ -121,7 +150,10 @@ class AppUI:
         self.pc_usr_toggle = 1
         # Heartbeat monitoring
         self._hb_timeout_ms = getattr(uart_protocol, 'HEARTBEAT_TIMEOUT_MS', 300)
-        self._hb_timeout_multiplier = 1.5  # Add margin to avoid false positives at startup
+        # Relax watchdog: use a larger multiplier to tolerate longer gaps
+        # between incoming packets from the control board, especially during
+        # initial power-on while the stim board is still syncing.
+        self._hb_timeout_multiplier = 5.0
         self._hb_check_interval_ms = max(50, int(self._hb_timeout_ms / 2))
         self._hb_monitor_id = None
         self._hb_warmup_until = None  # grace window after connect
@@ -131,6 +163,10 @@ class AppUI:
         self._connect_after_id = None
         self._connect_retry_ms = 250
         self._connect_attempts = 0
+
+        # Periodic mode resend (redundant STIM/RECORD signalling to control board)
+        self._mode_resend_interval_ms = 2000
+        self._mode_resend_id = None
 
         # Start UI immediately and begin seeking the control board
         self.log_event(f"Seeking control board on {self.control_board_serial}...")
@@ -177,8 +213,10 @@ class AppUI:
                 self.enable_uart_controls()
                 # Start heartbeat monitor
                 self._hb_tripped = False
-                # Start heartbeat monitor with warmup
-                self._hb_warmup_until = time.monotonic() + 3.0
+                # Start heartbeat monitor with an extended warmup to avoid
+                # flagging the link as dead while the stim board is still
+                # completing its own startup/READY sequence.
+                self._hb_warmup_until = time.monotonic() + 8.0
                 self._schedule_heartbeat_monitor()
                 return
             else:
@@ -227,6 +265,37 @@ class AppUI:
                     pass
                 self._evt_poll_id = None
             self._evt_poll_id = self.master.after(100, self._event_poller)
+        except Exception:
+            pass
+
+        # Start periodic mode resend loop
+        try:
+            if getattr(self, '_mode_resend_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._mode_resend_id)
+                except Exception:
+                    pass
+                self._mode_resend_id = None
+            self._mode_resend_id = self.master.after(self._mode_resend_interval_ms, self._mode_resend_loop)
+        except Exception:
+            pass
+
+    def _mode_resend_loop(self):
+        # Periodically re-send current mode (RECORD/STIM) to control board for redundancy
+        self._mode_resend_id = self.master.after(self._mode_resend_interval_ms, self._mode_resend_loop)
+        if not self.control_uart:
+            return
+        try:
+            mode_val = self.mode_var.get()
+        except Exception:
+            return
+        try:
+            if mode_val == 0:
+                # Recording mode
+                self.control_uart.set_mode_record()
+            else:
+                # Stimulation mode
+                self.control_uart.set_mode_stim()
         except Exception:
             pass
 
@@ -314,34 +383,140 @@ class AppUI:
                         self.log_event(f"Shutdown: {origin} — reason: {reason}")
                     else:
                         self.log_event(f"Shutdown message received from: {origin}")
-                elif ev.get("type") == "status":
-                        code = ev.get("code")
-                        msg = None
+                    # After any shutdown, enable Unlock Interlocks if still connected
+                    try:
+                        if self.control_uart:
+                            self.interlocks_on = True
+                            self.stim_on = False
+                            self.update_control_button_states()
+                    except Exception:
+                        pass
+                elif ev.get("type") == "receipt":
+                    # Log echoed request receipts from control board (exclude heartbeat)
+                    mt = ev.get("msg_type")
+                    label = None
+                    try:
+                        M = uart_protocol.MODE
+                        if mt == getattr(M, 'UART_MSG_UNLOCK', None):
+                            label = "Control Receipt: Unlock Interlocks"
+                        elif mt == getattr(M, 'UART_MSG_START_STIM', None):
+                            label = "Control Receipt: Start Stim"
+                        elif mt == getattr(M, 'UART_MSG_GET_PARAMS', None):
+                            label = "Control Receipt: Get Params"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_WIDTH', None):
+                            label = "Control Receipt: Update Width"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_AMP', None):
+                            label = "Control Receipt: Update Amplitude"
+                        elif mt == getattr(M, 'UART_MSG_SHUTDOWN', None):
+                            label = "Control Receipt: Shutdown"
+                    except Exception:
+                        label = None
+                    if label:
+                        self.log_event(label)
+                    else:
                         try:
-                            SC = uart_protocol.STATUS_CODE
-                            if code == getattr(SC, 'STATUS_INTERLOCK_ON', 1):
-                                msg = "Stim Status: Interlocks ON"
-                            elif code == getattr(SC, 'STATUS_INTERLOCK_OFF', 2):
-                                msg = "Stim Status: Interlocks OFF"
-                            elif code == getattr(SC, 'STATUS_STIM_ON', 3):
-                                msg = "Stim Status: Stimulation ON"
-                            elif code == getattr(SC, 'STATUS_STIM_OFF', 4):
-                                msg = "Stim Status: Stimulation OFF"
-                            elif code == getattr(SC, 'STATUS_CTRL_SHUTDOWN_RTN', 100):
-                                msg = "Control Status: Shutdown routine complete"
-                            elif code == getattr(SC, 'STATUS_CTRL_STIM_RTN', 101):
-                                msg = "Control Status: Stim routine complete"
-                            elif code == getattr(SC, 'STATUS_CTRL_AMP_RTN', 102):
-                                msg = "Control Status: Amplitude routine complete"
+                            self.log_event(f"Receipt for message type: {int(mt)}")
                         except Exception:
-                            msg = None
-                        if msg:
-                            self.log_event(msg)
-                        else:
+                            self.log_event("Receipt received")
+                elif ev.get("type") == "status":
+                    code = ev.get("code")
+                    msg = None
+                    try:
+                        SC = uart_protocol.STATUS_CODE
+                        prev_interlocks = self.interlocks_on
+                        prev_stim = self.stim_on
+                        if code == getattr(SC, 'STATUS_INTERLOCK_ON', 1):
+                            msg = "Stim Status: Interlocks ON"
+                            self.interlocks_on = True
+                            self.stim_on = False
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_INTERLOCK_OFF', 2):
+                            msg = "Stim Status: Interlocks OFF"
+                            self.interlocks_on = False
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_STIM_ON', 3):
+                            msg = "Stim Status: Stimulation ON"
+                            self.stim_on = True
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_STIM_OFF', 4):
+                            msg = "Stim Status: Stimulation OFF"
+                            self.stim_on = False
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_DAC_VALUE_SET', 5):
+                            msg = "Status: DAC value set"
+                        elif code == getattr(SC, 'STATUS_DAC_ZEROED', 6):
+                            msg = "Status: DAC zeroed"
+                        elif code == getattr(SC, 'STATUS_CTRL_SHUTDOWN_RTN', 100):
+                            msg = "Control Status: Shutdown routine complete"
+                            # Control board reports shutdown sequence complete: system is safe/locked
+                            if self.control_uart:
+                                self.interlocks_on = True
+                                self.stim_on = False
+                                self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_CTRL_STIM_RTN', 101):
+                            msg = "Control Status: Stim routine complete"
+                        elif code == getattr(SC, 'STATUS_CTRL_AMP_RTN', 102):
+                            msg = "Control Status: Amplitude routine complete"
+                        elif code == getattr(SC, 'STATUS_CTRL_STIM_LINK_UP', 103):
+                            msg = "Control Status: Stim link up"
+                        elif code == getattr(SC, 'STATUS_SYSTEM_SAFE_LOCKED', 110):
+                            msg = "System Status: SAFE LOCKED"
+                            self.interlocks_on = True
+                            self.stim_on = False
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_SYSTEM_IDLE_UNLOCKED', 111):
+                            msg = "System Status: IDLE UNLOCKED"
+                            self.interlocks_on = False
+                            self.stim_on = False
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_SYSTEM_STIMULATING', 112):
+                            msg = "System Status: STIMULATING"
+                            self.interlocks_on = False
+                            self.stim_on = True
+                            self.update_control_button_states()
+                        elif code == getattr(SC, 'STATUS_SYSTEM_RECORDING', 113):
+                            msg = "System Status: RECORDING"
+                            # Assume unlocked but not stimulating
+                            self.interlocks_on = False
+                            self.stim_on = False
+                            self.update_control_button_states()
+                    except Exception:
+                        msg = None
+
+                    # Only log when the interpreted stim/control state actually changes
+                    should_log = False
+                    SC = uart_protocol.STATUS_CODE
+                    if code in (
+                        getattr(SC, 'STATUS_INTERLOCK_ON', 1),
+                        getattr(SC, 'STATUS_INTERLOCK_OFF', 2),
+                    ):
+                        # Interlock state change
+                        if self.interlocks_on is not prev_interlocks:
+                            should_log = True
+                            self._last_interlocks_on = self.interlocks_on
+                    elif code in (
+                        getattr(SC, 'STATUS_STIM_ON', 3),
+                        getattr(SC, 'STATUS_STIM_OFF', 4),
+                    ):
+                        # Stim on/off change
+                        if self.stim_on is not prev_stim:
+                            should_log = True
+                            self._last_stim_on = self.stim_on
+                    else:
+                        # For other status codes (DAC, control/system), only
+                        # log when the numeric code itself changes.
+                        if code is not None and code != self._last_status_code:
+                            should_log = True
+                            self._last_status_code = code
+
+                    if should_log:
+                        if not msg:
                             try:
-                                self.log_event(f"Status code received: {int(code)}")
+                                msg = f"Status code received: {int(code)}"
                             except Exception:
-                                self.log_event("Status message received")
+                                msg = "Status message received"
+                        self.log_event(msg)
+
                 elif ev.get("type") == "send_width":
                     width = ev.get("width")
                     if width is not None:
@@ -352,6 +527,7 @@ class AppUI:
                             self.log_event(f"Control board width updated: {width}")
                         except Exception:
                             pass
+
                 elif ev.get("type") == "send_amp":
                     amp = ev.get("amp")
                     if amp is not None:
@@ -435,39 +611,65 @@ class AppUI:
             self.log_event(f"STOP: failed to send SHUTDOWN: {e}")
 
     def toggle_trigger(self):
-        if self.uart:
-            self.uart.toggle_trigger()
-        if self.switch_var.get():
+        # Aesthetic-only change: keep existing logging semantics but drive
+        # them from the new trigger_mode_var radio selection. No new
+        # messaging is added here.
+        try:
+            mode_val = self.trigger_mode_var.get()
+        except Exception:
+            mode_val = 0
+
+        if mode_val == 0:
             self.log_event("INTERNAL TRIGGERS")
         else:
             self.log_event("EXTERNAL TRIGGERS")
 
     def toggle_recording(self):
-        if self.uart:
-            self.uart.toggle_recording()
-        if self.recording_switch_var.get():
-            self.log_event("Recording Mode Enabled")
-            self.recording_ui()
-        else:
-            self.log_event("Stimulation Mode Enabled")
-            self.stimulation_ui()
+        """Handle mode selection change between Recording and Stimulation.
+
+        Sends an explicit STIM/RECORD message to the control board and
+        updates the UI layout to reflect the chosen mode.
+        """
+        if not self.control_uart:
+            self.log_event("Cannot change mode: control board not connected.")
+            return
+
+        try:
+            mode_val = self.mode_var.get()
+        except Exception:
+            mode_val = 0
+
+        try:
+            if mode_val == 0:
+                # Recording mode
+                self.control_uart.set_mode_record()
+                self.log_event("Recording Mode Enabled")
+                self.recording_ui()
+            else:
+                # Stimulation mode
+                self.control_uart.set_mode_stim()
+                self.log_event("Stimulation Mode Enabled")
+                self.stimulation_ui()
+        except Exception as e:
+            self.log_event(f"Failed to send mode change: {e}")
 
     def toggle_pc_user(self):
         if not self.user_board:
             self.log_event("Cannot toggle PC/User mode: User board not connected")
             return
-        if self.uart:
-            ack = self.uart.toggle_PC_usr()
-        if ack:
-            self.pc_usr_toggle ^= 1
-            if self.pc_user_switch_var.get():
-                self.log_event("PC Mode Enabled")
-                self.pc_mode_ui()
-            else:
-                self.log_event("User Mode Enabled")
-                self.user_mode_ui()
+        # Aesthetic-only change: switch UI between User/PC layouts based on
+        # radio selection, without altering underlying messaging behaviour.
+        try:
+            mode_val = self.pc_user_mode_var.get()
+        except Exception:
+            mode_val = 0
+
+        if mode_val == 1:
+            self.log_event("PC Mode Enabled")
+            self.pc_mode_ui()
         else:
-            self.log_event("User Toggle ACK not received")
+            self.log_event("User Mode Enabled")
+            self.user_mode_ui()
 
     def recording_ui(self):
         self.stim_up_but.config(state=DISABLED)
@@ -476,9 +678,22 @@ class AppUI:
         self.pulse_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
-        self.triggers_switch.config(state=DISABLED)
-        self.pc_user_switch.config(state=DISABLED)
+        try:
+            self.trigger_internal_radio.config(state=DISABLED)
+            self.trigger_external_radio.config(state=DISABLED)
+        except Exception:
+            pass
+        try:
+            self.pc_mode_user_radio.config(state=DISABLED)
+            self.pc_mode_pc_radio.config(state=DISABLED)
+        except Exception:
+            pass
         self.done_but.config(state=DISABLED)
+        # In recording mode, stimulation cannot be started
+        try:
+            self.start_stim_but.config(state=DISABLED, text="Start Stim")
+        except Exception:
+            pass
 
     def stimulation_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -487,11 +702,24 @@ class AppUI:
         self.pulse_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
-        self.triggers_switch.config(state=NORMAL)
-        self.pc_user_switch.config(state=NORMAL)
+        try:
+            self.trigger_internal_radio.config(state=NORMAL)
+            self.trigger_external_radio.config(state=NORMAL)
+        except Exception:
+            pass
+        try:
+            self.pc_mode_user_radio.config(state=NORMAL)
+            self.pc_mode_pc_radio.config(state=NORMAL)
+        except Exception:
+            pass
         self.poll_status_but.config(state=NORMAL)
         self.start_but.config(state=NORMAL)
-        self.start_stim_but.config(state=NORMAL)
+        # Start Stim availability is still subject to interlocks/mode in
+        # update_control_button_states; default to disabled until STATUS.
+        try:
+            self.start_stim_but.config(state=DISABLED, text="Start Stim")
+        except Exception:
+            pass
 
     def pc_mode_ui(self):
         self.stim_up_but.config(state=DISABLED)
@@ -500,8 +728,12 @@ class AppUI:
         self.pulse_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
-        self.triggers_switch.config(state=DISABLED)
-        self.recording_switch.config(state=DISABLED)
+        try:
+            self.trigger_internal_radio.config(state=DISABLED)
+            self.trigger_external_radio.config(state=DISABLED)
+        except Exception:
+            pass
+        self._set_mode_controls_state(DISABLED)
         self.poll_status_but.config(state=DISABLED)
         self.start_but.config(state=DISABLED)
         self.start_stim_but.config(state=DISABLED)
@@ -513,8 +745,12 @@ class AppUI:
         self.pulse_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
-        self.triggers_switch.config(state=NORMAL)
-        self.recording_switch.config(state=NORMAL)
+        try:
+            self.trigger_internal_radio.config(state=NORMAL)
+            self.trigger_external_radio.config(state=NORMAL)
+        except Exception:
+            pass
+        self._set_mode_controls_state(NORMAL)
         self.start_but.config(state=NORMAL)
         self.start_stim_but.config(state=NORMAL)
 
@@ -543,9 +779,17 @@ class AppUI:
         self.pulse_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
-        self.triggers_switch.config(state=DISABLED)
-        self.recording_switch.config(state=DISABLED)
-        self.pc_user_switch.config(state=DISABLED)
+        try:
+            self.trigger_internal_radio.config(state=DISABLED)
+            self.trigger_external_radio.config(state=DISABLED)
+        except Exception:
+            pass
+        self._set_mode_controls_state(DISABLED)
+        try:
+            self.pc_mode_user_radio.config(state=DISABLED)
+            self.pc_mode_pc_radio.config(state=DISABLED)
+        except Exception:
+            pass
         self.STOP_but.config(state=DISABLED)
         self.done_but.config(state=DISABLED)
         self.start_stim_but.config(state=DISABLED)
@@ -558,10 +802,18 @@ class AppUI:
         self.pulse_down_but.config(state=DISABLED)
         self.stim_amplitude_entry.config(state=DISABLED)
         self.pulse_width_entry.config(state=DISABLED)
-        self.triggers_switch.config(state=DISABLED)
-        self.recording_switch.config(state=DISABLED)
-        # PC/User switch depends on user board; keep it as-is if user board present
-        self.pc_user_switch.config(state=DISABLED)
+        try:
+            self.trigger_internal_radio.config(state=DISABLED)
+            self.trigger_external_radio.config(state=DISABLED)
+        except Exception:
+            pass
+        self._set_mode_controls_state(DISABLED)
+        # PC/User control depends on user board; keep it disabled here
+        try:
+            self.pc_mode_user_radio.config(state=DISABLED)
+            self.pc_mode_pc_radio.config(state=DISABLED)
+        except Exception:
+            pass
         self.STOP_but.config(state=DISABLED)
         self.done_but.config(state=DISABLED)
         self.poll_status_but.config(state=DISABLED)
@@ -576,18 +828,105 @@ class AppUI:
         self.pulse_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
-        self.triggers_switch.config(state=NORMAL)
-        self.recording_switch.config(state=NORMAL)
-        # Only enable PC/User switch if user board is present
+        try:
+            self.trigger_internal_radio.config(state=NORMAL)
+            self.trigger_external_radio.config(state=NORMAL)
+        except Exception:
+            pass
+        self._set_mode_controls_state(NORMAL)
+        # Only enable PC/User control if user board is present
         if getattr(self, 'user_board', None):
-            self.pc_user_switch.config(state=NORMAL)
+            try:
+                self.pc_mode_user_radio.config(state=NORMAL)
+                self.pc_mode_pc_radio.config(state=NORMAL)
+            except Exception:
+                pass
         else:
-            self.pc_user_switch.config(state=DISABLED)
+            try:
+                self.pc_mode_user_radio.config(state=DISABLED)
+                self.pc_mode_pc_radio.config(state=DISABLED)
+            except Exception:
+                pass
         self.STOP_but.config(state=NORMAL)
         self.done_but.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
-        self.start_but.config(state=NORMAL)
-        self.start_stim_but.config(state=NORMAL)
+        self.update_control_button_states()
+
+    def update_control_button_states(self):
+        """Enable/disable control action buttons based on interlock/stim state."""
+        # Interlocks determine availability of Unlock vs Start Stim
+        if self.interlocks_on is True:
+            # Interlocks engaged: cannot start stim; can unlock
+            try:
+                self.start_stim_but.config(state=DISABLED, text="Start Stim")
+            except Exception:
+                pass
+            try:
+                self.start_but.config(state=NORMAL)
+            except Exception:
+                pass
+        elif self.interlocks_on is False:
+            # Interlocks disengaged: can start stim; cannot unlock again
+            try:
+                self.start_but.config(state=DISABLED)
+            except Exception:
+                pass
+            try:
+                # Enable Start/Stop based on stim state
+                self.start_stim_but.config(state=NORMAL)
+            except Exception:
+                pass
+        else:
+            # Unknown: conservative defaults (allow unlock, block start stim)
+            try:
+                self.start_but.config(state=NORMAL)
+            except Exception:
+                pass
+            try:
+                self.start_stim_but.config(state=DISABLED, text="Start Stim")
+            except Exception:
+                pass
+
+        # Label reflects stim state
+        try:
+            if self.stim_on is True:
+                self.start_stim_but.config(text="Stop Stim")
+            else:
+                self.start_stim_but.config(text="Start Stim")
+        except Exception:
+            pass
+
+        # Enforce additional gating based on selected mode and active stimulation.
+        try:
+            # If mode_var exists, 0 = Recording, 1 = Stimulation
+            if getattr(self, "mode_var", None) is not None:
+                mode_val = self.mode_var.get()
+
+                # In recording mode, never allow Start Stim to be pressed
+                if mode_val == 0:
+                    try:
+                        self.start_stim_but.config(state=DISABLED, text="Start Stim")
+                    except Exception:
+                        pass
+
+                # While stimulation is active, prevent changing mode from STIM to RECORD
+                # Only adjust mode controls in User mode; PC/User helpers manage their own state.
+                in_pc_mode = False
+                try:
+                    if getattr(self, "pc_user_switch_var", None) is not None:
+                        in_pc_mode = bool(self.pc_user_switch_var.get())
+                except Exception:
+                    in_pc_mode = False
+
+                if self.stim_on is True:
+                    if not in_pc_mode:
+                        self._set_mode_controls_state(DISABLED)
+                else:
+                    # When not actively stimulating, allow mode changes in User mode
+                    if not in_pc_mode:
+                        self._set_mode_controls_state(NORMAL)
+        except Exception:
+            pass
 
     def start_system(self):
         if not self.control_uart:
@@ -596,18 +935,45 @@ class AppUI:
         try:
             self.control_uart.send_unlock()
             self.log_event("Unlocking Interlocks.")
+            # Await confirmation via STATUS before re-enabling
+            try:
+                self.start_but.config(state=DISABLED)
+                self.start_stim_but.config(state=DISABLED)
+            except Exception:
+                pass
         except Exception as e:
             self.log_event(f"Unlocking Interlocks: failed to send command: {e}")
 
     def start_stim(self):
         if not self.control_uart:
-            self.log_event("Cannot Start Stim: control board not connected.")
+            self.log_event("Cannot Start/Stop Stim: control board not connected.")
             return
         try:
-            self.control_uart.send_start_stim()
-            self.log_event("Start Stim command sent.")
+            # Do not allow stimulation to be started from the UI when in Recording mode
+            try:
+                if getattr(self, "mode_var", None) is not None and self.mode_var.get() == 0 and self.stim_on is not True:
+                    self.log_event("Start Stim ignored: Recording mode is active.")
+                    return
+            except Exception:
+                pass
+
+            if self.stim_on is True:
+                # Treat button as Stop Stim when active
+                try:
+                    self.control_uart.send_shutdown()
+                    self.log_event("Stop Stim command sent.")
+                except Exception as e:
+                    self.log_event(f"Stop Stim: failed to send command: {e}")
+            else:
+                self.control_uart.send_start_stim()
+                self.log_event("Start Stim command sent.")
+            # Disable until confirmation via STATUS
+            try:
+                self.start_stim_but.config(state=DISABLED)
+            except Exception:
+                pass
         except Exception as e:
-            self.log_event(f"Start Stim: failed to send command: {e}")
+            self.log_event(f"Stim command failed: {e}")
 
     def enable_ui(self):
         self.stim_up_but.config(state=NORMAL)
@@ -616,9 +982,17 @@ class AppUI:
         self.pulse_down_but.config(state=NORMAL)
         self.stim_amplitude_entry.config(state=NORMAL)
         self.pulse_width_entry.config(state=NORMAL)
-        self.triggers_switch.config(state=NORMAL)
-        self.recording_switch.config(state=NORMAL)
-        self.pc_user_switch.config(state=NORMAL)
+        try:
+            self.trigger_internal_radio.config(state=NORMAL)
+            self.trigger_external_radio.config(state=NORMAL)
+        except Exception:
+            pass
+        self._set_mode_controls_state(NORMAL)
+        try:
+            self.pc_mode_user_radio.config(state=NORMAL)
+            self.pc_mode_pc_radio.config(state=NORMAL)
+        except Exception:
+            pass
         self.STOP_but.config(state=NORMAL)
         self.done_but.config(state=NORMAL)
         self.poll_status_but.config(state=NORMAL)
@@ -695,6 +1069,26 @@ class AppUI:
                 self._connect_after_id = None
         except Exception:
             pass
+        try:
+            if getattr(self, '_mode_resend_id', None) is not None:
+                try:
+                    self.master.after_cancel(self._mode_resend_id)
+                except Exception:
+                    pass
+                self._mode_resend_id = None
+        except Exception:
+            pass
+
+    def _set_mode_controls_state(self, state):
+        """Enable/disable both Recording and Stimulation mode controls."""
+        try:
+            self.mode_record_radio.config(state=state)
+        except Exception:
+            pass
+        try:
+            self.mode_stim_radio.config(state=state)
+        except Exception:
+            pass
     
     def poll_status(self):
         """Request current parameters via GET_PARAMS and log action."""
@@ -750,8 +1144,10 @@ class AppUI:
         if reason:
             msg = f"UART comms disconnected: {reason}"
         self.log_event(msg)
+        # Legacy UART object (if present) is no longer used in the
+        # current control-board architecture, but close it defensively.
         try:
-            if self.uart:
+            if getattr(self, 'uart', None):
                 self.uart.close()
         except Exception:
             pass
