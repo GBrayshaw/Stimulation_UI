@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 from metavision_sdk_core import PolarityFilterAlgorithm
 from metavision_sdk_stream import Camera, CameraStreamSlicer
@@ -9,8 +9,14 @@ import serial
 import threading
 import time
 import queue
+import struct
 from gpiozero import DigitalOutputDevice, DigitalInputDevice
 import uart_protocol
+import json
+
+from cri.robot import SyncRobot, AsyncRobot
+from cri.controller import RTDEController 
+from cri.controller import MG400Controller as Controller
 
 MODE = uart_protocol.MODE
 PAYLOAD_TYPE = uart_protocol.PAYLOAD_TYPE
@@ -36,6 +42,24 @@ class IO2Pulse:
         self.use_external_triggers = False  # default to internal triggers
         self.in_safe_state = False
         self._awaiting_ack = False
+
+        # Stimulation parameters
+        self.pulse_width = 0            # in microseconds
+        self.stim_amplitude = 0.0       # in appropriate current units (e.g. uA)
+        self.frequency = 0              # in Hz
+        self.low_frequency = 200    # Hardcoded frequencies of stimulation 
+        self.mid_frequency = 500
+        self.high_frequency = 1000
+
+        # Spike encoding parameters
+        self.high_spike_threshold = 20000  # Spike rates for trigger logic
+        self.mid_spike_threshold = 10000
+        self.low_spike_threshold = 5000
+        self.time_window_us = 10000   # Time window for spike counting in microseconds
+        # Sliding time-window spike counting state
+        self._window_start_ts = None   # start timestamp (µs) of current counting window
+        self._events_in_window = 0     # number of events in current window
+
         # Internal log queue for cross-thread status messages
         self._log_queue = queue.Queue()
 
@@ -140,7 +164,19 @@ class IO2Pulse:
 
         deadline = time.monotonic() + max(0.0, timeout_s)
         while time.monotonic() < deadline and not self._stop_event.is_set():
-            start = self.ser.read(1)
+            try:
+                start = self.ser.read(1)
+            except serial.SerialException:
+                # Serial link broke; mark as disconnected and exit
+                self.log_message("Serial error while reading: closing link.")
+                try:
+                    if self.ser and self.ser.is_open:
+                        self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+                return None
+
             if not start or start[0] != UART_START_BYTE:
                 continue
 
@@ -174,6 +210,8 @@ class IO2Pulse:
         - MODE.UART_MSG_TRIG_EXTERNAL: select external trigger mode (use this class)
         - MODE.UART_MSG_TRIG_INTERNAL: select internal trigger mode
         - MODE.UART_MSG_ACK: clear safe state after shutdown
+        - MODE.UART_MSG_UPDATE_WIDTH: set internal pulse_width
+        - MODE.UART_MSG_UPDATE_AMP: set internal stim_amplitude
         """
         while not self._stop_event.is_set():
             pkt = self._read_packet(timeout_s=0.5)
@@ -199,6 +237,31 @@ class IO2Pulse:
                     self._awaiting_ack = False
                     self.in_safe_state = False
                     self.log_message("Received ACK: leaving safe shutdown state.")
+                elif msg_type == MODE.UART_MSG_UPDATE_WIDTH:
+                    width = None
+                    try:
+                        if payload_type == PAYLOAD_TYPE.PAYLOAD_INT32 and payload and len(payload) == 4:
+                            width = int.from_bytes(payload, byteorder="big", signed=True)
+                        elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload:
+                            b = bytes(payload[:4]).ljust(4, b"\x00")
+                            width = int.from_bytes(b, byteorder="big", signed=True)
+                    except Exception:
+                        width = None
+                    if width is not None:
+                        self.pulse_width = width
+                        self.log_message(f"Received UPDATE_WIDTH: pulse_width set to {width}.")
+                elif msg_type == MODE.UART_MSG_UPDATE_AMP:
+                    amp = None
+                    try:
+                        if payload_type == PAYLOAD_TYPE.PAYLOAD_FLOAT32 and payload and len(payload) == 4:
+                            amp = struct.unpack('>f', payload)[0]
+                        elif payload_type == PAYLOAD_TYPE.PAYLOAD_BYTES and payload and len(payload) >= 4:
+                            amp = struct.unpack('>f', bytes(payload[:4]))[0]
+                    except Exception:
+                        amp = None
+                    if amp is not None:
+                        self.stim_amplitude = float(amp)
+                        self.log_message(f"Received UPDATE_AMP: stim_amplitude set to {self.stim_amplitude:.3f}.")
 
     def is_safe(self) -> bool:
         with self._state_lock:
@@ -207,6 +270,37 @@ class IO2Pulse:
     def using_external_triggers(self) -> bool:
         with self._state_lock:
             return self.use_external_triggers
+
+    def get_pulse_width(self) -> int:
+        with self._state_lock:
+            return int(self.pulse_width)
+
+    def get_stim_amplitude(self) -> float:
+        with self._state_lock:
+            return float(self.stim_amplitude)
+
+    def get_frequency(self) -> int:
+        with self._state_lock:
+            return int(self.frequency)
+
+    def set_frequency(self, freq: int):
+        """Setter for frequency that also generates a log entry.
+
+        This is intended to drive the UI indicator via the regular
+        _update_state_labels polling loop in CameraIOApp.
+        """
+        with self._state_lock:
+            self.frequency = int(freq)
+            current = self.frequency
+        # Log outside the lock
+        self.log_message(f"Frequency updated to {current} Hz.")
+
+    # Connection status helpers
+    def is_camera_connected(self) -> bool:
+        return (self.camera is not None) and (self.slicer is not None)
+
+    def is_pi_connected(self) -> bool:
+        return (self.ser is not None) and getattr(self.ser, "is_open", False)
 
     def stop(self):
         """Signal the background thread to stop and wait for it to finish."""
@@ -335,32 +429,190 @@ class IO2Pulse:
         if self.slicer is None:
             return
 
-        for ev_slice in self.slicer:
-            if self._stop_event.is_set():
-                break
+        try:
+            for ev_slice in self.slicer:
+                if self._stop_event.is_set():
+                    break
 
-            _ = ev_slice.events.size    # Grab the number of events in this slice
+                # Check current mode
+                with self._state_lock:
+                    use_trig = self.use_external_triggers
+                    safe = self.in_safe_state
 
-            # Check current mode    
-            with self._state_lock:
-                use_trig = self.use_external_triggers
-                safe = self.in_safe_state
+                # Always consume the slice to keep camera streaming, but only
+                # drive GPIO when external triggers are enabled and not in a
+                # safe state.
+                evs = ev_slice.events
+                if not (use_trig and not safe):
+                    continue
 
-            # Always consume the slice to keep camera streaming, but only
-            # drive GPIO when external triggers are enabled and not in a
-            # safe state.
-            if use_trig and not safe:
-                # TODO: Implement trigger output logic based on events
-                if self.trigger_logic():
-                    self.trigger_out.blink(on_time=0.01, off_time=0.99, n=1)  # Example: blink every second
-            
-    def trigger_logic(self) -> bool:
-        """Define the logic to determine when to trigger output.
+                if evs.size <= 0:
+                    continue
 
-        This is a placeholder function and should be implemented based on
-        specific requirements for triggering based on event data.
+                evs_sorted_ts = evs["t"].sort()
+
+                # Initialise window start on first event in packet
+                if self._window_start_ts is None:
+                    self._window_start_ts = evs_sorted_ts[0]
+                    self._events_in_window = 0
+
+                # If still within the current window, accumulate
+                if (evs_sorted_ts[-1] - self._window_start_ts) <= self.time_window_us:
+                    self._events_in_window += evs.size  # NOTE: This dismisses packets that lay in between windows in favour of processing speed
+                else:
+                    # Window completed: evaluate spike count and
+                    # optionally drive a trigger pulse.
+                    trig = self.trigger_logic(self._events_in_window)
+                    if trig and self.frequency > 0:
+                        period_s = 1.0 / float(self.frequency)
+                        # Convert pulse width from µs to seconds
+                        pw_s = max(float(self.pulse_width) / 1e6, 0.0)
+                        off_s = max(period_s - pw_s, 0.0)
+                        num_pulses = int(self.time_window_us / 1e6 / period_s)  # Fill window with pulses at f
+                        self.trigger_out.blink(on_time=pw_s, off_time=off_s, n=num_pulses)
+
+                    # Start a new window anchored at this event
+                    self._window_start_ts = None
+                    self._events_in_window = 0
+
+        except Exception:
+            # Treat any exception as a lost camera connection
+            self.log_message("Camera stream error: disconnecting camera.")
+            self.camera = None
+            self.slicer = None
+
+    def trigger_logic(self, events_in_window: int) -> bool:
+        """Map spike count in a completed time window to trigger decision.
+
+        events_in_window is the number of events observed during the most
+        recent time window of length self.time_window_us (µs). This updates
+        the internal frequency and returns True if a trigger pulse should be
+        emitted for that window.
         """
-        return True
+        if events_in_window < self.low_spike_threshold:
+            self.set_frequency(0)
+            return False
+        elif self.low_spike_threshold <= events_in_window < self.mid_spike_threshold:
+            self.set_frequency(self.low_frequency)
+            return True
+        elif self.mid_spike_threshold <= events_in_window < self.high_spike_threshold:
+            self.set_frequency(self.mid_frequency)
+            return True
+        else:
+            self.set_frequency(self.high_frequency)
+            return True
+
+
+class RobotController:
+    def __init__(self, connect: bool = True):
+        self.base_frame = (353, 18, -35, 0, 0, 90)	# base frame: x->front, y->left, z->up, rz->anticlockwise
+        self.work_frame = (353, 18, -80, 0, 0, 90)
+        self.tap_move = None
+        self.tcp = (0, 0, -50, 0, 0, 0)
+        self.linear_speed = 0
+
+        # In-memory metadata dictionary describing the robot configuration
+        self.meta = {
+            "base_frame": list(self.base_frame),
+            "work_frame": list(self.work_frame),
+            "tap_move": self.tap_move,
+            "tcp": list(self.tcp),
+            "linear_speed": self.linear_speed,
+        }
+
+        # Optional hardware connection. For UI meta operations we may
+        # construct this controller with connect=False to avoid blocking
+        # if robot hardware is unavailable.
+        self.robot = None
+        if connect:
+            try:
+                self.robot = self._make_robot()
+            except Exception:
+                self.robot = None
+
+            # If the robot was created successfully, try to apply the
+            # configured frames and speed, but do not discard the robot
+            # object if any of these assignments fail.
+            if self.robot is not None:
+                try:
+                    self.robot.tcp = self.tcp
+                except Exception:
+                    pass
+                try:
+                    self.robot.coord_frame = self.base_frame
+                except Exception:
+                    pass
+                try:
+                    self.robot.speed = self.linear_speed
+                except Exception:
+                    pass
+
+    def _make_robot(self) -> AsyncRobot:
+        return AsyncRobot(SyncRobot(Controller()))
+
+    def close_robot(self):
+        if self.robot is not None:
+            try:
+                self.robot.close()
+            except Exception:
+                pass
+            self.robot = None
+
+    def make_meta(self, filename):
+        """Save the current robot configuration to a JSON meta file."""
+        # Refresh meta from current attributes
+        self.meta = {
+            "base_frame": list(self.base_frame),
+            "work_frame": list(self.work_frame),
+            "tap_move": self.tap_move,
+            "tcp": list(self.tcp),
+            "linear_speed": self.linear_speed,
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(self.meta, f, indent=2)
+
+    def get_meta(self, filename):
+        """Load robot configuration from a JSON meta file into this instance."""
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Update attributes from the loaded meta, falling back to existing
+        # values when keys are missing.
+        if "base_frame" in data:
+            self.base_frame = tuple(data["base_frame"])
+        if "work_frame" in data:
+            self.work_frame = tuple(data["work_frame"])
+        if "tap_move" in data:
+            self.tap_move = data["tap_move"]
+        if "tcp" in data:
+            self.tcp = tuple(data["tcp"])
+        if "linear_speed" in data:
+            self.linear_speed = data["linear_speed"]
+
+        # Keep meta in sync
+        self.meta = {
+            "base_frame": list(self.base_frame),
+            "work_frame": list(self.work_frame),
+            "tap_move": self.tap_move,
+            "tcp": list(self.tcp),
+            "linear_speed": self.linear_speed,
+        }
+
+        # If a robot instance exists, update its runtime configuration
+        if getattr(self, "robot", None) is not None:
+            try:
+                self.robot.tcp = self.tcp
+            except Exception:
+                pass
+            try:
+                self.robot.coord_frame = self.base_frame
+            except Exception:
+                pass
+            try:
+                self.robot.speed = self.linear_speed
+            except Exception:
+                pass
+
 
 
 class CameraIOApp:
@@ -376,6 +628,11 @@ class CameraIOApp:
 
         # Underlying IO2Pulse controller
         self.io = IO2Pulse()
+        
+        # Underlying Robot controller (created on demand)
+        self.robot_ctrl: RobotController | None = None
+        self._robot_connecting = False
+        self._robot_connect_timeout_ms = 5000
 
         # Shutdown button (top-right, denoted by 'X')
         self.shutdown_button = tk.Button(master, text="X", command=self.on_shutdown, width=3)
@@ -395,20 +652,53 @@ class CameraIOApp:
         self.pi_button = tk.Button(master, text="Connect / Reconnect Pi", command=self.on_connect_pi, width=18)
         self.pi_button.grid(row=3, column=0, padx=10, pady=5, sticky="w")
 
+        # Robot status and connect button
+        self.robot_status = tk.Label(master, text="Robot: disconnected")
+        self.robot_status.grid(row=4, column=0, padx=10, pady=10, sticky="w")
+
+        self.robot_button = tk.Button(master, text="Connect Robot", command=self.on_connect_robot, width=18)
+        self.robot_button.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+
+        # Robot meta load/save buttons
+        self.load_meta_button = tk.Button(master, text="Load Meta", command=self.on_load_robot_meta, width=12)
+        self.load_meta_button.grid(row=4, column=1, padx=10, pady=5, sticky="w")
+
+        self.save_meta_button = tk.Button(master, text="Save Meta", command=self.on_save_robot_meta, width=12)
+        self.save_meta_button.grid(row=5, column=1, padx=10, pady=5, sticky="w")
+
+        # Display box for current robot meta data
+        self.robot_meta_text = tk.Text(master, width=40, height=6, state="disabled")
+        self.robot_meta_text.grid(row=4, column=2, rowspan=2, padx=10, pady=5, sticky="nw")
+
         # State indicators for External Trigger and Safe State flags
         self.trigger_state_label = tk.Label(master, text="External Trigger: OFF")
-        self.trigger_state_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        self.trigger_state_label.grid(row=6, column=0, padx=10, pady=5, sticky="w")
 
         self.safe_state_label = tk.Label(master, text="Safe State: INACTIVE")
-        self.safe_state_label.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        self.safe_state_label.grid(row=7, column=0, padx=10, pady=5, sticky="w")
+
+        # Indicators for pulse width and stimulation amplitude driven by UART
+        self.pulse_width_var = tk.StringVar(value="Pulse Width: —")
+        self.pulse_width_label = tk.Label(master, textvariable=self.pulse_width_var)
+        self.pulse_width_label.grid(row=8, column=0, padx=10, pady=5, sticky="w")
+
+        self.stim_amp_var = tk.StringVar(value="Stim Amplitude: —")
+        self.stim_amp_label = tk.Label(master, textvariable=self.stim_amp_var)
+        self.stim_amp_label.grid(row=9, column=0, padx=10, pady=5, sticky="w")
+
+        # Indicator for current trigger frequency as computed from events
+        self.freq_var = tk.StringVar(value="Frequency: —")
+        self.freq_label = tk.Label(master, textvariable=self.freq_var)
+        self.freq_label.grid(row=10, column=0, padx=10, pady=5, sticky="w")
 
         # Log window for connection attempts and messages from the other Pi
         self.log_text = tk.Text(master, width=60, height=12, state="disabled")
-        self.log_text.grid(row=6, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
+        self.log_text.grid(row=11, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
 
         # Periodic polling of IO2Pulse log queue and state flags
         self._poll_logs()
         self._update_state_labels()
+        self._update_robot_meta_box()
 
         # Ensure window close via titlebar also performs a safe shutdown
         self.master.protocol("WM_DELETE_WINDOW", self.on_shutdown)
@@ -418,6 +708,12 @@ class CameraIOApp:
         """Confirm shutdown, then stop IO2Pulse and close the UI."""
         if not messagebox.askokcancel("Shutdown", "Shut down IO2Pulse and close the window?"):
             return
+        # Cleanly close any active robot connection first
+        try:
+            if self.robot_ctrl is not None:
+                self.robot_ctrl.close_robot()
+        except Exception:
+            pass
         try:
             self.io.stop()
         except Exception:
@@ -435,10 +731,18 @@ class CameraIOApp:
         if ok:
             self.camera_status.config(text="Camera: connected")
             self._append_log("Camera connected.")
+            try:
+                self.camera_button.config(state="disabled")
+            except Exception:
+                pass
         else:
             self.camera_status.config(text="Camera: disconnected")
             messagebox.showerror("Camera Connection", "Unable to connect to an event camera.")
             self._append_log("Camera connection failed.")
+            try:
+                self.camera_button.config(state="normal")
+            except Exception:
+                pass
 
     def on_connect_pi(self):
         """Attempt to connect (or reconnect) the USB link to the peer Pi."""
@@ -451,10 +755,193 @@ class CameraIOApp:
         if ok:
             self.pi_status.config(text=f"Pi link: connected on {self.io.serial_port}")
             self._append_log(f"Pi connected on {self.io.serial_port}.")
+            try:
+                self.pi_button.config(state="disabled")
+            except Exception:
+                pass
         else:
             self.pi_status.config(text="Pi link: disconnected")
             messagebox.showerror("Pi Connection", f"Unable to open serial port {self.io.serial_port}.")
             self._append_log("Pi connection failed.")
+            try:
+                self.pi_button.config(state="normal")
+            except Exception:
+                pass
+
+    def on_connect_robot(self):
+        """Attempt to construct and connect the Robot without blocking the UI.
+
+        Spawns a background thread to create RobotController and uses a
+        soft timeout so the UI can recover if the connection takes too long.
+        """
+        # If we already have a controller and robot object, do nothing
+        if self.robot_ctrl is not None and getattr(self.robot_ctrl, "robot", None) is not None:
+            return
+        if self._robot_connecting:
+            return
+
+        self._robot_connecting = True
+        self.robot_status.config(text="Robot: connecting...")
+        try:
+            self.robot_button.config(state="disabled")
+        except Exception:
+            pass
+        self._append_log("Starting robot connection attempt...")
+
+        # Start connection in a worker thread to avoid blocking Tk
+        def worker(start_time: float):
+            ctrl = None
+            err = None
+            try:
+                ctrl = RobotController()
+            except Exception as e:  # noqa: BLE001
+                err = e
+
+            # Hand result back to Tk main loop
+            try:
+                self.master.after(0, lambda: self._on_robot_connect_result(start_time, ctrl, err))
+            except Exception:
+                # If we cannot schedule back to Tk, just drop the result
+                pass
+
+        start = time.monotonic()
+        threading.Thread(target=worker, args=(start,), daemon=True).start()
+
+        # Schedule a timeout check
+        try:
+            self.master.after(self._robot_connect_timeout_ms, self._check_robot_connect_timeout, start)
+        except Exception:
+            pass
+
+    def _on_robot_connect_result(self, start_time: float, ctrl: RobotController | None, err: Exception | None):
+        """Handle completion of the robot connection attempt on the Tk thread."""
+        # If a newer attempt has started or we've already timed out, ignore
+        if not self._robot_connecting:
+            return
+
+        elapsed_ms = int((time.monotonic() - start_time) * 1000)
+
+        if err is not None:
+            self.robot_ctrl = None
+            self.robot_status.config(text="Robot: disconnected")
+            self._append_log(f"Robot connection failed: {err}")
+            self._robot_connecting = False
+            try:
+                self.robot_button.config(state="normal")
+            except Exception:
+                pass
+            return
+
+        self.robot_ctrl = ctrl
+        robot_obj = getattr(self.robot_ctrl, "robot", None) if self.robot_ctrl is not None else None
+
+        if robot_obj is not None and elapsed_ms <= self._robot_connect_timeout_ms:
+            self.robot_status.config(text="Robot: connected")
+            self._append_log("Robot connected successfully.")
+            self._robot_connecting = False
+            try:
+                self.robot_button.config(state="disabled")
+            except Exception:
+                pass
+        else:
+            # Either no robot object or connection exceeded timeout
+            self.robot_ctrl = None
+            self.robot_status.config(text="Robot: disconnected")
+            if elapsed_ms > self._robot_connect_timeout_ms:
+                self._append_log("Robot connection timed out.")
+            else:
+                self._append_log("Robot connection failed.")
+            self._robot_connecting = False
+            try:
+                self.robot_button.config(state="normal")
+            except Exception:
+                pass
+
+    def _check_robot_connect_timeout(self, start_time: float):
+        """Soft timeout: if still connecting after the window, re-enable UI."""
+        if not self._robot_connecting:
+            return
+        # If another attempt has started since, don't interfere
+        # (we only care about cases where the worker is still blocking).
+        self._append_log("Robot connection taking too long; marking as failed.")
+        self.robot_ctrl = None
+        self.robot_status.config(text="Robot: disconnected")
+        self._robot_connecting = False
+        try:
+            self.robot_button.config(state="normal")
+        except Exception:
+            pass
+
+    def _require_robot_ctrl(self) -> bool:
+        """Ensure a RobotController exists; used for meta load/save.
+
+        Returns True if available, False otherwise. Does not attempt a robot
+        hardware connection if one is not already present.
+        """
+        if self.robot_ctrl is None:
+            # Create a controller shell without forcing the UI to hang if
+            # hardware is unreachable; rely on its own error handling.
+            try:
+                # Do not attempt a hardware connection here; this is only
+                # for working with meta data and should not block the UI.
+                self.robot_ctrl = RobotController(connect=False)
+            except Exception as e:  # noqa: BLE001
+                self.robot_ctrl = None
+                self._append_log(f"Failed to create RobotController: {e}")
+                messagebox.showerror("Robot Meta", "Unable to create robot controller for meta operations.")
+                return False
+        # Update meta display with whatever default meta we have
+        self._update_robot_meta_box()
+        return True
+
+    def on_load_robot_meta(self):
+        """Let the user choose a meta.json file and load it into the robot controller."""
+        if not self._require_robot_ctrl():
+            return
+
+        filename = filedialog.askopenfilename(
+            title="Select Robot Meta File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+
+        try:
+            self.robot_ctrl.get_meta(filename)
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"Failed to load robot meta from {filename}: {e}")
+            messagebox.showerror("Robot Meta", f"Failed to load meta file:\n{e}")
+            return
+
+        self._append_log(f"Loaded robot meta from {filename}.")
+        try:
+            self.robot_status.config(text="Robot: meta loaded")
+        except Exception:
+            pass
+        self._update_robot_meta_box()
+
+    def on_save_robot_meta(self):
+        """Save the current robot meta dictionary to a user-selected file."""
+        if not self._require_robot_ctrl():
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="Save Robot Meta File",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+
+        try:
+            self.robot_ctrl.make_meta(filename)
+        except Exception as e:  # noqa: BLE001
+            self._append_log(f"Failed to save robot meta to {filename}: {e}")
+            messagebox.showerror("Robot Meta", f"Failed to save meta file:\n{e}")
+            return
+
+        self._append_log(f"Saved robot meta to {filename}.")
+        self._update_robot_meta_box()
 
     # Internal helpers
     def _append_log(self, message: str):
@@ -469,6 +956,27 @@ class CameraIOApp:
             self.log_text.insert("end", line)
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _update_robot_meta_box(self):
+        """Refresh the on-screen view of the current robot meta data."""
+        text = ""
+        try:
+            if self.robot_ctrl is not None and getattr(self.robot_ctrl, "meta", None) is not None:
+                try:
+                    text = json.dumps(self.robot_ctrl.meta, indent=2)
+                except Exception:
+                    text = str(self.robot_ctrl.meta)
+        except Exception:
+            text = ""
+
+        try:
+            self.robot_meta_text.configure(state="normal")
+            self.robot_meta_text.delete("1.0", "end")
+            if text:
+                self.robot_meta_text.insert("end", text)
+            self.robot_meta_text.configure(state="disabled")
         except Exception:
             pass
 
@@ -500,9 +1008,50 @@ class CameraIOApp:
         trig_text = "External Trigger: ON" if use_trig else "External Trigger: OFF"
         safe_text = "Safe State: ACTIVE" if safe else "Safe State: INACTIVE"
 
+        # Also reflect pulse width and stimulation amplitude values
+        try:
+            pw = self.io.get_pulse_width()
+        except Exception:
+            pw = None
+        try:
+            sa = self.io.get_stim_amplitude()
+        except Exception:
+            sa = None
+
+        try:
+            freq = self.io.get_frequency()
+        except Exception:
+            freq = None
+
+        # Connection states for enabling/disabling connect buttons
+        try:
+            cam_connected = self.io.is_camera_connected()
+        except Exception:
+            cam_connected = False
+        try:
+            pi_connected = self.io.is_pi_connected()
+        except Exception:
+            pi_connected = False
+
         try:
             self.trigger_state_label.config(text=trig_text)
             self.safe_state_label.config(text=safe_text)
+            if pw is not None:
+                self.pulse_width_var.set(f"Pulse Width: {pw}")
+            else:
+                self.pulse_width_var.set("Pulse Width: —")
+            if sa is not None:
+                self.stim_amp_var.set(f"Stim Amplitude: {sa:.3f}")
+            else:
+                self.stim_amp_var.set("Stim Amplitude: —")
+            if freq is not None and freq > 0:
+                self.freq_var.set(f"Frequency: {freq} Hz")
+            else:
+                self.freq_var.set("Frequency: —")
+
+            # Enable/disable connect buttons based on connection state
+            self.camera_button.config(state="disabled" if cam_connected else "normal")
+            self.pi_button.config(state="disabled" if pi_connected else "normal")
         except Exception:
             pass
 
