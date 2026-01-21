@@ -652,23 +652,47 @@ class CameraIOApp:
         self.pi_button = tk.Button(master, text="Connect / Reconnect Pi", command=self.on_connect_pi, width=18)
         self.pi_button.grid(row=3, column=0, padx=10, pady=5, sticky="w")
 
-        # Robot status and connect button
+        # Robot status and connect button (right side)
         self.robot_status = tk.Label(master, text="Robot: disconnected")
-        self.robot_status.grid(row=4, column=0, padx=10, pady=10, sticky="w")
+        self.robot_status.grid(row=1, column=2, padx=10, pady=10, sticky="w")
 
         self.robot_button = tk.Button(master, text="Connect Robot", command=self.on_connect_robot, width=18)
-        self.robot_button.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        self.robot_button.grid(row=2, column=2, padx=10, pady=5, sticky="w")
 
-        # Robot meta load/save buttons
+        # Robot meta load/save buttons (right side)
         self.load_meta_button = tk.Button(master, text="Load Meta", command=self.on_load_robot_meta, width=12)
-        self.load_meta_button.grid(row=4, column=1, padx=10, pady=5, sticky="w")
+        self.load_meta_button.grid(row=3, column=2, padx=10, pady=5, sticky="w")
 
         self.save_meta_button = tk.Button(master, text="Save Meta", command=self.on_save_robot_meta, width=12)
-        self.save_meta_button.grid(row=5, column=1, padx=10, pady=5, sticky="w")
+        self.save_meta_button.grid(row=4, column=2, padx=10, pady=5, sticky="w")
 
-        # Display box for current robot meta data
+        # Display box for current robot meta data (right side)
         self.robot_meta_text = tk.Text(master, width=40, height=6, state="disabled")
-        self.robot_meta_text.grid(row=4, column=2, rowspan=2, padx=10, pady=5, sticky="nw")
+        self.robot_meta_text.grid(row=5, column=2, rowspan=2, padx=10, pady=5, sticky="nw")
+
+        # Editable fields for key robot meta parameters (labels left of entries)
+        tk.Label(master, text="Base Frame").grid(row=7, column=2, padx=10, pady=(10, 2), sticky="e")
+        self.base_frame_entry = tk.Entry(master, width=30)
+        self.base_frame_entry.grid(row=7, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(master, text="Work Frame").grid(row=8, column=2, padx=10, pady=(10, 2), sticky="e")
+        self.work_frame_entry = tk.Entry(master, width=30)
+        self.work_frame_entry.grid(row=8, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(master, text="TCP").grid(row=9, column=2, padx=10, pady=(10, 2), sticky="e")
+        self.tcp_entry = tk.Entry(master, width=30)
+        self.tcp_entry.grid(row=9, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(master, text="Linear Speed").grid(row=10, column=2, padx=10, pady=(10, 2), sticky="e")
+        self.linear_speed_entry = tk.Entry(master, width=30)
+        self.linear_speed_entry.grid(row=10, column=3, padx=5, pady=2, sticky="w")
+
+        tk.Label(master, text="Tap Move").grid(row=11, column=2, padx=10, pady=(10, 2), sticky="e")
+        self.tap_move_entry = tk.Entry(master, width=30)
+        self.tap_move_entry.grid(row=11, column=3, padx=5, pady=2, sticky="w")
+
+        self.apply_meta_button = tk.Button(master, text="Apply Meta Changes", command=self.on_apply_robot_meta, width=18)
+        self.apply_meta_button.grid(row=12, column=3, padx=10, pady=5, sticky="e")
 
         # State indicators for External Trigger and Safe State flags
         self.trigger_state_label = tk.Label(master, text="External Trigger: OFF")
@@ -692,8 +716,8 @@ class CameraIOApp:
         self.freq_label.grid(row=10, column=0, padx=10, pady=5, sticky="w")
 
         # Log window for connection attempts and messages from the other Pi
-        self.log_text = tk.Text(master, width=60, height=12, state="disabled")
-        self.log_text.grid(row=11, column=0, columnspan=3, padx=10, pady=10, sticky="nsew")
+        self.log_text = tk.Text(master, width=60, height=10, state="disabled")
+        self.log_text.grid(row=13, column=0, columnspan=4, padx=10, pady=10, sticky="nsew")
 
         # Periodic polling of IO2Pulse log queue and state flags
         self._poll_logs()
@@ -943,6 +967,84 @@ class CameraIOApp:
         self._append_log(f"Saved robot meta to {filename}.")
         self._update_robot_meta_box()
 
+    def on_apply_robot_meta(self):
+        """Apply values from the editable meta fields into the robot meta.
+
+        Parses JSON for the frame- and TCP-like fields and a float for
+        linear_speed. Updates RobotController attributes and meta dict,
+        and pushes changes to any active robot instance.
+        """
+        if not self._require_robot_ctrl():
+            return
+
+        ctrl = self.robot_ctrl
+        if ctrl is None:
+            return
+
+        # Helper to parse JSON from an entry, returning None on failure
+        def _parse_json_entry(entry_widget):
+            text = entry_widget.get().strip()
+            if not text:
+                return None
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+
+        # Start from current meta
+        meta = dict(getattr(ctrl, "meta", {}))
+
+        base_val = _parse_json_entry(self.base_frame_entry)
+        if isinstance(base_val, (list, tuple)) and len(base_val) == 6:
+            ctrl.base_frame = tuple(base_val)
+            meta["base_frame"] = list(ctrl.base_frame)
+
+        work_val = _parse_json_entry(self.work_frame_entry)
+        if isinstance(work_val, (list, tuple)) and len(work_val) == 6:
+            ctrl.work_frame = tuple(work_val)
+            meta["work_frame"] = list(ctrl.work_frame)
+
+        tcp_val = _parse_json_entry(self.tcp_entry)
+        if isinstance(tcp_val, (list, tuple)) and len(tcp_val) == 6:
+            ctrl.tcp = tuple(tcp_val)
+            meta["tcp"] = list(ctrl.tcp)
+
+        lin_text = self.linear_speed_entry.get().strip()
+        if lin_text:
+            try:
+                ctrl.linear_speed = float(lin_text)
+                meta["linear_speed"] = ctrl.linear_speed
+            except Exception:
+                pass
+
+        tap_val = _parse_json_entry(self.tap_move_entry)
+        # tap_move can be any JSON-serialisable structure or None
+        if tap_val is not None or self.tap_move_entry.get().strip() == "":
+            ctrl.tap_move = tap_val
+            meta["tap_move"] = ctrl.tap_move
+
+        # Store updated meta back on controller
+        ctrl.meta = meta
+
+        # If robot hardware is connected, push configuration
+        robot_obj = getattr(ctrl, "robot", None)
+        if robot_obj is not None:
+            try:
+                robot_obj.tcp = ctrl.tcp
+            except Exception:
+                pass
+            try:
+                robot_obj.coord_frame = ctrl.base_frame
+            except Exception:
+                pass
+            try:
+                robot_obj.speed = ctrl.linear_speed
+            except Exception:
+                pass
+
+        self._append_log("Applied robot meta changes from UI fields.")
+        self._update_robot_meta_box()
+
     # Internal helpers
     def _append_log(self, message: str):
         """Append a line to the log window from the Tk main thread."""
@@ -977,6 +1079,31 @@ class CameraIOApp:
             if text:
                 self.robot_meta_text.insert("end", text)
             self.robot_meta_text.configure(state="disabled")
+        except Exception:
+            pass
+
+        # Also keep the editable fields in sync with the current meta
+        try:
+            ctrl = self.robot_ctrl
+            meta = getattr(ctrl, "meta", {}) if ctrl is not None else {}
+
+            def _set_entry(entry_widget, value, as_json: bool = False):
+                try:
+                    entry_widget.delete(0, "end")
+                    if value is None:
+                        return
+                    if as_json:
+                        entry_widget.insert(0, json.dumps(value))
+                    else:
+                        entry_widget.insert(0, str(value))
+                except Exception:
+                    pass
+
+            _set_entry(self.base_frame_entry, meta.get("base_frame"), as_json=True)
+            _set_entry(self.work_frame_entry, meta.get("work_frame"), as_json=True)
+            _set_entry(self.tcp_entry, meta.get("tcp"), as_json=True)
+            _set_entry(self.linear_speed_entry, meta.get("linear_speed"), as_json=False)
+            _set_entry(self.tap_move_entry, meta.get("tap_move"), as_json=True)
         except Exception:
             pass
 
