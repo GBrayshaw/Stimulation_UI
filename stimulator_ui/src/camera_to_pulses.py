@@ -1,8 +1,9 @@
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
 
 from metavision_sdk_core import PolarityFilterAlgorithm
 from metavision_sdk_stream import Camera, CameraStreamSlicer
+from metavision_sdk_ui import MTWindow, BaseWindow, EventLoop
 import numpy as np
 from collections import deque
 import serial
@@ -85,6 +86,10 @@ class IO2Pulse:
         # Event camera processing thread (run loop)
         self._camera_thread = None
 
+        # Optional event display sharing state with UI thread
+        self._display_queue = queue.Queue(maxsize=1)
+        self._display_window = None
+
     # Logging trigger input state changes
     def trigger_in_thread(self):
         """Background thread: record microsecond timestamps on every input edge.
@@ -155,6 +160,44 @@ class IO2Pulse:
             except Exception:
                 break
         return msgs
+
+    # ----------------------------
+    # Event display sharing helpers
+    # ----------------------------
+    def set_display_window(self, window: MTWindow | None):
+        """Associate an MTWindow created on the main thread with this IO instance.
+
+        The window object itself must be constructed and destroyed on the main
+        thread (typically Tk's), but this class can safely render into it by
+        exchanging frames through a queue.
+        """
+        self._display_window = window
+
+    def _push_display_frame(self, frame: np.ndarray):
+        """Push a new frame for display, dropping any pending older one.
+
+        Called from the camera thread; the UI thread will periodically fetch
+        the latest frame and pass it to MTWindow.show_async.
+        """
+        if self._display_queue.full():
+            try:
+                self._display_queue.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            self._display_queue.put_nowait(frame)
+        except queue.Full:
+            pass
+
+    def get_latest_display_frame(self):
+        """Return the most recent frame waiting to be displayed, if any."""
+        latest = None
+        while True:
+            try:
+                latest = self._display_queue.get_nowait()
+            except queue.Empty:
+                break
+        return latest
 
     def _read_packet(self, timeout_s: float = 0.5):
         # If serial link is not available, wait briefly and return None
@@ -430,6 +473,9 @@ class IO2Pulse:
             return
 
         try:
+            # Reusable buffer for visualisation; lazily sized on first slice
+            display_frame = None
+
             for ev_slice in self.slicer:
                 if self._stop_event.is_set():
                     break
@@ -439,41 +485,59 @@ class IO2Pulse:
                     use_trig = self.use_external_triggers
                     safe = self.in_safe_state
 
-                # Always consume the slice to keep camera streaming, but only
-                # drive GPIO when external triggers are enabled and not in a
-                # safe state.
                 evs = ev_slice.events
-                if not (use_trig and not safe):
-                    continue
 
-                if evs.size <= 0:
-                    continue
+                # ---- Trigger logic (unchanged behaviour) ----
+                if use_trig and not safe:
+                    if evs.size > 0:
+                        evs_sorted_ts = evs["t"].sort()
 
-                evs_sorted_ts = evs["t"].sort()
+                        # Initialise window start on first event in packet
+                        if self._window_start_ts is None:
+                            self._window_start_ts = evs_sorted_ts[0]
+                            self._events_in_window = 0
 
-                # Initialise window start on first event in packet
-                if self._window_start_ts is None:
-                    self._window_start_ts = evs_sorted_ts[0]
-                    self._events_in_window = 0
+                        # If still within the current window, accumulate
+                        if (evs_sorted_ts[-1] - self._window_start_ts) <= self.time_window_us:
+                            # NOTE: This dismisses packets that lay in between
+                            # windows in favour of processing speed
+                            self._events_in_window += evs.size
+                        else:
+                            # Window completed: evaluate spike count and
+                            # optionally drive a trigger pulse.
+                            trig = self.trigger_logic(self._events_in_window)
+                            if trig and self.frequency > 0:
+                                period_s = 1.0 / float(self.frequency)
+                                # Convert pulse width from µs to seconds
+                                pw_s = max(float(self.pulse_width) / 1e6, 0.0)
+                                off_s = max(period_s - pw_s, 0.0)
+                                # Fill window with pulses at f
+                                num_pulses = int(self.time_window_us / 1e6 / period_s)
+                                self.trigger_out.blink(on_time=pw_s, off_time=off_s, n=num_pulses)
 
-                # If still within the current window, accumulate
-                if (evs_sorted_ts[-1] - self._window_start_ts) <= self.time_window_us:
-                    self._events_in_window += evs.size  # NOTE: This dismisses packets that lay in between windows in favour of processing speed
-                else:
-                    # Window completed: evaluate spike count and
-                    # optionally drive a trigger pulse.
-                    trig = self.trigger_logic(self._events_in_window)
-                    if trig and self.frequency > 0:
-                        period_s = 1.0 / float(self.frequency)
-                        # Convert pulse width from µs to seconds
-                        pw_s = max(float(self.pulse_width) / 1e6, 0.0)
-                        off_s = max(period_s - pw_s, 0.0)
-                        num_pulses = int(self.time_window_us / 1e6 / period_s)  # Fill window with pulses at f
-                        self.trigger_out.blink(on_time=pw_s, off_time=off_s, n=num_pulses)
+                            # Start a new window anchored at this event
+                            self._window_start_ts = None
+                            self._events_in_window = 0
 
-                    # Start a new window anchored at this event
-                    self._window_start_ts = None
-                    self._events_in_window = 0
+                # ---- Optional event visualisation for UI ----
+                if self._display_window is not None and evs.size > 0:
+                    xs = evs["x"]
+                    ys = evs["y"]
+                    try:
+                        h = int(ys.max()) + 1
+                        w = int(xs.max()) + 1
+                    except ValueError:
+                        # Empty arrays after filtering
+                        continue
+
+                    if display_frame is None or display_frame.shape != (h, w):
+                        display_frame = np.zeros((h, w), dtype=np.uint8)
+                    else:
+                        display_frame.fill(0)
+
+                    display_frame[ys, xs] = 255
+                    # Push a copy so the UI thread owns the buffer
+                    self._push_display_frame(display_frame.copy())
 
         except Exception:
             # Treat any exception as a lost camera connection
@@ -613,7 +677,52 @@ class RobotController:
             except Exception:
                 pass
 
+    def move_home(self):
+        """Move the robot to the home pose in the base frame."""
+        if self.robot is None:
+            raise RuntimeError("Robot not connected")
+        # Ensure we are in the correct frame, then move to origin
+        try:
+            self.robot.coord_frame = self.base_frame
+        except Exception:
+            pass
+        self.robot.move_linear((0, 0, 0, 0, 0, 0))
 
+    def perform_tap(self, hold_time: int = 0):
+        """Perform a tap motion using the configured tap_move poses.
+
+        Expects tap_move to be a 2-element sequence of poses
+        [up_pose, down_pose]. The robot moves home, into the work frame,
+        then down to the tap, holds for hold_time seconds, returns up,
+        and finally goes home again.
+        """
+        if self.robot is None:
+            raise RuntimeError("Robot not connected")
+
+        tap_move = self.meta.get("tap_move", None)
+        if tap_move is None:
+            raise RuntimeError("Tap move not configured")
+        if not isinstance(tap_move, (list, tuple)) or len(tap_move) != 2:
+            raise RuntimeError("tap_move must be a sequence of two poses [up, down]")
+
+        up_pose, down_pose = tap_move
+
+        # Go to home, then into work frame at origin
+        self.move_home()
+        try:
+            self.robot.coord_frame = self.work_frame
+        except Exception:
+            pass
+        self.robot.move_linear((0, 0, 0, 0, 0, 0))
+
+        # Execute tap: down, hold, up
+        self.robot.move_linear(tuple(down_pose))
+        if hold_time > 0:
+            time.sleep(hold_time)
+        self.robot.move_linear(tuple(up_pose))
+
+        # Return home when finished
+        self.move_home()
 
 class CameraIOApp:
     """Simple Tk UI wrapper around IO2Pulse for manual control.
@@ -634,6 +743,9 @@ class CameraIOApp:
         self._robot_connecting = False
         self._robot_connect_timeout_ms = 5000
 
+        # Optional Prophesee event display window (owned by main thread)
+        self.event_window: MTWindow | None = None
+
         # Shutdown button (top-right, denoted by 'X')
         self.shutdown_button = tk.Button(master, text="X", command=self.on_shutdown, width=3)
         self.shutdown_button.grid(row=0, column=2, padx=10, pady=10, sticky="ne")
@@ -644,6 +756,10 @@ class CameraIOApp:
 
         self.camera_button = tk.Button(master, text="Connect Camera", command=self.on_connect_camera, width=18)
         self.camera_button.grid(row=1, column=0, padx=10, pady=5, sticky="w")
+
+        # Button to show/hide the Prophesee event display window
+        self.event_window_button = tk.Button(master, text="Show Event Window", command=self.on_toggle_event_window, width=18)
+        self.event_window_button.grid(row=1, column=1, padx=10, pady=5, sticky="w")
 
         # Pi (serial) status and connect/reconnect button
         self.pi_status = tk.Label(master, text="Pi link: disconnected")
@@ -658,6 +774,13 @@ class CameraIOApp:
 
         self.robot_button = tk.Button(master, text="Connect Robot", command=self.on_connect_robot, width=18)
         self.robot_button.grid(row=2, column=2, padx=10, pady=5, sticky="w")
+
+        # Robot motion controls
+        self.home_button = tk.Button(master, text="Move Home", command=self.on_move_home, width=12)
+        self.home_button.grid(row=2, column=3, padx=10, pady=5, sticky="w")
+
+        self.tap_button = tk.Button(master, text="Perform Tap", command=self.on_perform_tap, width=12)
+        self.tap_button.grid(row=3, column=3, padx=10, pady=5, sticky="w")
 
         # Robot meta load/save buttons (right side)
         self.load_meta_button = tk.Button(master, text="Load Meta", command=self.on_load_robot_meta, width=12)
@@ -716,12 +839,17 @@ class CameraIOApp:
         self.freq_label.grid(row=10, column=0, padx=10, pady=5, sticky="w")
 
         # Log window for connection attempts and messages from the other Pi
-        self.log_text = tk.Text(master, width=60, height=10, state="disabled")
+        self.log_text = tk.Text(master, width=60, height=5, state="disabled")
         self.log_text.grid(row=13, column=0, columnspan=4, padx=10, pady=10, sticky="nsew")
 
         # Periodic polling of IO2Pulse log queue and state flags
         self._poll_logs()
         self._update_state_labels()
+        # Periodic polling of the Prophesee event window
+        self._poll_event_window()
+        # Ensure we have a default RobotController so the meta boxes and
+        # fields are populated with initial settings on startup.
+        self._require_robot_ctrl()
         self._update_robot_meta_box()
 
         # Ensure window close via titlebar also performs a safe shutdown
@@ -738,11 +866,65 @@ class CameraIOApp:
                 self.robot_ctrl.close_robot()
         except Exception:
             pass
+        # Clean up any open event display window
+        try:
+            if self.event_window is not None:
+                try:
+                    self.event_window.destroy()
+                except Exception:
+                    pass
+                self.event_window = None
+                self.io.set_display_window(None)
+        except Exception:
+            pass
         try:
             self.io.stop()
         except Exception:
             pass
         self.master.destroy()
+
+    def on_toggle_event_window(self):
+        """Show or hide the Prophesee event display window."""
+        # If window is currently closed, create it on the main thread
+        if self.event_window is None:
+            try:
+                self.event_window = MTWindow(
+                    "Event Camera Preview",
+                    640,
+                    480,
+                    BaseWindow.RenderMode.GRAY,
+                    open_directly=True,
+                )
+            except Exception:
+                self.event_window = None
+                messagebox.showerror("Event Window", "Unable to create event display window.")
+                return
+
+            # Let IO2Pulse know that a display window is available
+            try:
+                self.io.set_display_window(self.event_window)
+            except Exception:
+                pass
+
+            try:
+                self.event_window_button.config(text="Hide Event Window")
+            except Exception:
+                pass
+        else:
+            # Hide and destroy the existing window
+            try:
+                self.event_window.destroy()
+            except Exception:
+                pass
+            self.event_window = None
+            try:
+                self.io.set_display_window(None)
+            except Exception:
+                pass
+            try:
+                self.event_window_button.config(text="Show Event Window")
+            except Exception:
+                pass
 
     def on_connect_camera(self):
         """Attempt to connect (or reconnect) the event camera."""
@@ -914,8 +1096,6 @@ class CameraIOApp:
                 self._append_log(f"Failed to create RobotController: {e}")
                 messagebox.showerror("Robot Meta", "Unable to create robot controller for meta operations.")
                 return False
-        # Update meta display with whatever default meta we have
-        self._update_robot_meta_box()
         return True
 
     def on_load_robot_meta(self):
@@ -943,6 +1123,8 @@ class CameraIOApp:
         except Exception:
             pass
         self._update_robot_meta_box()
+        # Log the current meta contents for visibility
+        self._log_robot_meta_settings()
 
     def on_save_robot_meta(self):
         """Save the current robot meta dictionary to a user-selected file."""
@@ -966,6 +1148,98 @@ class CameraIOApp:
 
         self._append_log(f"Saved robot meta to {filename}.")
         self._update_robot_meta_box()
+
+    def on_move_home(self):
+        """Move the connected robot to its home pose, logging start and end."""
+        # Require an existing, connected robot
+        if self.robot_ctrl is None or getattr(self.robot_ctrl, "robot", None) is None:
+            self._append_log("Move home requested but robot is not connected.")
+            messagebox.showerror("Robot Move Home", "Robot is not connected.")
+            return
+
+        ctrl = self.robot_ctrl
+        self._append_log("Starting move to home pose.")
+
+        # Run the motion in a worker thread so the UI remains responsive
+        def worker(controller: RobotController):
+            ok = True
+            err: Exception | None = None
+            try:
+                controller.move_home()
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                err = e
+
+            # Report completion back on the Tk thread
+            try:
+                self.master.after(0, lambda: self._on_move_home_done(ok, err))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, args=(ctrl,), daemon=True).start()
+
+    def _on_move_home_done(self, ok: bool, err: Exception | None):
+        """Completion callback for move_home, executed on the Tk thread."""
+        if ok:
+            self._append_log("Completed move to home pose.")
+        else:
+            self._append_log(f"Move to home pose failed: {err}")
+            try:
+                messagebox.showerror("Robot Move Home", f"Move to home pose failed:\n{err}")
+            except Exception:
+                pass
+
+    def on_perform_tap(self):
+        """Prompt for hold_time and perform a tap motion on the robot."""
+        if self.robot_ctrl is None or getattr(self.robot_ctrl, "robot", None) is None:
+            self._append_log("Perform tap requested but robot is not connected.")
+            messagebox.showerror("Robot Tap", "Robot is not connected.")
+            return
+
+        # Ask the user for a hold time in seconds
+        try:
+            hold_time = simpledialog.askfloat(
+                "Tap Hold Time",
+                "Enter tap hold time (seconds):",
+                minvalue=0.0,
+            )
+        except Exception:
+            hold_time = None
+
+        # User cancelled or invalid
+        if hold_time is None:
+            self._append_log("Tap operation cancelled by user.")
+            return
+
+        ctrl = self.robot_ctrl
+        self._append_log(f"Starting tap with hold_time={hold_time:.3f} s.")
+
+        def worker(controller: RobotController, ht: float):
+            ok = True
+            err: Exception | None = None
+            try:
+                controller.perform_tap(ht)
+            except Exception as e:  # noqa: BLE001
+                ok = False
+                err = e
+
+            try:
+                self.master.after(0, lambda: self._on_perform_tap_done(ok, err, ht))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, args=(ctrl, hold_time), daemon=True).start()
+
+    def _on_perform_tap_done(self, ok: bool, err: Exception | None, hold_time: float):
+        """Completion callback for perform_tap, executed on the Tk thread."""
+        if ok:
+            self._append_log(f"Completed tap with hold_time={hold_time:.3f} s.")
+        else:
+            self._append_log(f"Tap operation failed: {err}")
+            try:
+                messagebox.showerror("Robot Tap", f"Tap operation failed:\n{err}")
+            except Exception:
+                pass
 
     def on_apply_robot_meta(self):
         """Apply values from the editable meta fields into the robot meta.
@@ -1044,6 +1318,8 @@ class CameraIOApp:
 
         self._append_log("Applied robot meta changes from UI fields.")
         self._update_robot_meta_box()
+        # Log the updated meta contents
+        self._log_robot_meta_settings()
 
     # Internal helpers
     def _append_log(self, message: str):
@@ -1061,15 +1337,42 @@ class CameraIOApp:
         except Exception:
             pass
 
+    def _log_robot_meta_settings(self):
+        """Write current robot meta settings into the log as '"name":data' lines."""
+        try:
+            if self.robot_ctrl is None or getattr(self.robot_ctrl, "meta", None) is None:
+                return
+            meta = self.robot_ctrl.meta
+        except Exception:
+            return
+
+        for key, value in meta.items():
+            try:
+                try:
+                    data_str = json.dumps(value)
+                except Exception:
+                    data_str = str(value)
+                self._append_log(f'"{key}":{data_str}')
+            except Exception:
+                continue
+
     def _update_robot_meta_box(self):
         """Refresh the on-screen view of the current robot meta data."""
         text = ""
         try:
             if self.robot_ctrl is not None and getattr(self.robot_ctrl, "meta", None) is not None:
-                try:
-                    text = json.dumps(self.robot_ctrl.meta, indent=2)
-                except Exception:
-                    text = str(self.robot_ctrl.meta)
+                # Format meta in the same '"name":data' style as the log
+                lines = []
+                for key, value in self.robot_ctrl.meta.items():
+                    try:
+                        try:
+                            data_str = json.dumps(value)
+                        except Exception:
+                            data_str = str(value)
+                        lines.append(f'"{key}":{data_str}')
+                    except Exception:
+                        continue
+                text = "\n".join(lines)
         except Exception:
             text = ""
 
@@ -1121,6 +1424,67 @@ class CameraIOApp:
         except Exception:
             pass
 
+    def _poll_event_window(self):
+        """Periodically update the Prophesee event window from the IO2Pulse queue.
+
+        This runs on the Tk main thread, satisfies the EventLoop and MTWindow
+        threading requirements, and keeps the camera trigger logic entirely in
+        the IO2Pulse camera thread.
+        """
+        try:
+            win = self.event_window
+        except Exception:
+            win = None
+
+        if win is not None:
+            # Poll and dispatch window events on the main thread
+            try:
+                EventLoop.poll_and_dispatch(0)
+            except Exception:
+                pass
+
+            try:
+                win.poll_events()
+            except Exception:
+                pass
+
+            # Get the latest frame prepared by the camera thread
+            try:
+                frame = self.io.get_latest_display_frame()
+            except Exception:
+                frame = None
+
+            if frame is not None:
+                try:
+                    win.show_async(frame, auto_poll=False)
+                except Exception:
+                    pass
+
+            # Handle user closing the native window directly
+            try:
+                if win.should_close():
+                    try:
+                        win.destroy()
+                    except Exception:
+                        pass
+                    self.event_window = None
+                    try:
+                        self.io.set_display_window(None)
+                    except Exception:
+                        pass
+                    try:
+                        self.event_window_button.config(text="Show Event Window")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Schedule next poll regardless of current window state
+        try:
+            self.master.after(20, self._poll_event_window)
+        except Exception:
+            pass
+
     def _update_state_labels(self):
         """Refresh the External Trigger and Safe State indicators."""
         try:
@@ -1160,6 +1524,15 @@ class CameraIOApp:
         except Exception:
             pi_connected = False
 
+        # Robot connection state for enabling/disabling motion buttons
+        try:
+            robot_connected = (
+                self.robot_ctrl is not None and
+                getattr(self.robot_ctrl, "robot", None) is not None
+            )
+        except Exception:
+            robot_connected = False
+
         try:
             self.trigger_state_label.config(text=trig_text)
             self.safe_state_label.config(text=safe_text)
@@ -1179,6 +1552,9 @@ class CameraIOApp:
             # Enable/disable connect buttons based on connection state
             self.camera_button.config(state="disabled" if cam_connected else "normal")
             self.pi_button.config(state="disabled" if pi_connected else "normal")
+            # Enable/disable robot motion buttons based on robot connection state
+            self.home_button.config(state="normal" if robot_connected else "disabled")
+            self.tap_button.config(state="normal" if robot_connected else "disabled")
         except Exception:
             pass
 
