@@ -14,6 +14,8 @@ import struct
 from gpiozero import DigitalOutputDevice, DigitalInputDevice
 import uart_protocol
 import json
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
 from cri.robot import SyncRobot, AsyncRobot
 from cri.controller import RTDEController 
@@ -37,20 +39,22 @@ class IO2Pulse:
         # Camera objects (connected via connect_camera)
         self.camera = None
         self.slicer = None
+        # Monotonic timestamp when camera was (last) successfully connected
+        self.camera_start_time_s = None
 
         # Trigger mode and safety state, controlled via UART messages from peer Pi
         # use_external_triggers == True means this class should drive triggers
-        self.use_external_triggers = False  # default to internal triggers
+        self.use_external_triggers = True # default to external triggers
         self.in_safe_state = False
         self._awaiting_ack = False
 
         # Stimulation parameters
         self.pulse_width = 0            # in microseconds
         self.stim_amplitude = 0.0       # in appropriate current units (e.g. uA)
-        self.frequency = 0              # in Hz
         self.low_frequency = 200    # Hardcoded frequencies of stimulation 
         self.mid_frequency = 500
         self.high_frequency = 1000
+        self.frequency = self.high_frequency       # NOTE: SET TO 0 AFTER TESTING              # in Hz
 
         # Spike encoding parameters
         self.high_spike_threshold = 20000  # Spike rates for trigger logic
@@ -82,13 +86,21 @@ class IO2Pulse:
         self.window_size_us = 5_000_000  # 5 seconds in microseconds
         self._timestamp_thread = threading.Thread(target=self.trigger_in_thread, daemon=True)
         self._timestamp_thread.start()
-
+        
         # Event camera processing thread (run loop)
         self._camera_thread = None
 
         # Optional event display sharing state with UI thread
         self._display_queue = queue.Queue(maxsize=1)
         self._display_window = None
+
+        # Trigger events history for UI plotting (last 5 seconds)
+        self._trigger_events = deque()
+        self.trigger_events_window_s = 5.0
+
+        # Debug: slice event-count history for UI plotting (last 5 seconds)
+        self._slice_events = deque()
+        self.slice_events_window_s = 5.0
 
     # Logging trigger input state changes
     def trigger_in_thread(self):
@@ -326,6 +338,62 @@ class IO2Pulse:
         with self._state_lock:
             return int(self.frequency)
 
+    # Trigger events logging helpers
+    def _get_trigger_level_for_freq(self, freq: int):
+        """Map a stimulation frequency to a discrete trigger level index.
+
+        Returns 0 for low, 1 for mid, 2 for high, or None if frequency does
+        not match any defined trigger level.
+        """
+        if freq == self.low_frequency:
+            return 0
+        if freq == self.mid_frequency:
+            return 1
+        if freq == self.high_frequency:
+            return 2
+        return None
+
+    def _log_trigger_event(self, level: int):
+        """Record that a trigger of the given level has been emitted now."""
+        now_s = time.monotonic()
+        with self._state_lock:
+            self._trigger_events.append((now_s, int(level)))
+            cutoff = now_s - self.trigger_events_window_s
+            while self._trigger_events and self._trigger_events[0][0] < cutoff:
+                self._trigger_events.popleft()
+
+    def get_trigger_events(self):
+        """Return a list of (timestamp_s, level) for recent trigger events."""
+        now_s = time.monotonic()
+        cutoff = now_s - self.trigger_events_window_s
+        with self._state_lock:
+            return [(t, lvl) for (t, lvl) in self._trigger_events if t >= cutoff]
+
+    def _log_slice_events(self, count: int):
+        """Record the number of events in the most recent camera slice.
+
+        Used for debugging: lets the UI plot evs.size over time in a
+        separate subplot.
+        """
+        now_s = time.monotonic()
+        with self._state_lock:
+            self._slice_events.append((now_s, int(count)))
+            cutoff = now_s - self.slice_events_window_s
+            while self._slice_events and self._slice_events[0][0] < cutoff:
+                self._slice_events.popleft()
+
+    def get_slice_event_counts(self):
+        """Return recent (timestamp_s, event_count) samples for debugging."""
+        now_s = time.monotonic()
+        cutoff = now_s - self.slice_events_window_s
+        with self._state_lock:
+            return [(t, c) for (t, c) in self._slice_events if t >= cutoff]
+
+    def get_camera_start_time(self) -> float | None:
+        """Return the monotonic time when the camera was last connected, if any."""
+        with self._state_lock:
+            return self.camera_start_time_s
+
     def set_frequency(self, freq: int):
         """Setter for frequency that also generates a log entry.
 
@@ -417,6 +485,10 @@ class IO2Pulse:
             self.log_message("Camera connection failed: error creating stream slicer.")
             return False
 
+        # Record camera connection start time for plotting
+        with self._state_lock:
+            self.camera_start_time_s = time.monotonic()
+
         if self._camera_thread is None or not self._camera_thread.is_alive():
             self._camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
             self._camera_thread.start()
@@ -485,37 +557,87 @@ class IO2Pulse:
                     use_trig = self.use_external_triggers
                     safe = self.in_safe_state
 
-                evs = ev_slice.events
+                evs = ev_slice.events   # Drain event buffer even if in safe mode/internal triggers
 
-                # ---- Trigger logic (unchanged behaviour) ----
+                # Debug logging of raw event counts per slice for plotting
+                if evs.size > 0:
+                    try:
+                        self._log_slice_events(evs.size)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._log_slice_events(0)
+                        continue
+                    except Exception:
+                        pass
+
+                # ---- Trigger logic ----
                 if use_trig and not safe:
-                    if evs.size > 0:
-                        evs_sorted_ts = evs["t"].sort()
+                    # Time span covered by this slice alone
+                    if (evs["t"][-1] - evs["t"][0]) >= self.time_window_us:
+                        # This slice by itself spans at least one full
+                        # window: evaluate a window using only the events
+                        # from this slice.
+                        trig = self.trigger_logic(evs.size)
+                        # Debug log of window evaluation
+                        try:
+                            self.log_message(
+                                f"Trigger window (single slice): count={evs.size}, trig={trig}, freq={self.frequency}"
+                            )
+                        except Exception:
+                            pass
 
-                        # Initialise window start on first event in packet
+                        if trig and self.frequency > 0:
+                            # Plot in trigger plot
+                            level = self._get_trigger_level_for_freq(self.frequency)
+                            if level is not None:
+                                self._log_trigger_event(level)
+
+                            # Output trigger pulse
+                            period_s = 1.0 / float(self.frequency)
+                            pw_s = max(float(self.pulse_width) / 1e6, 0.0)
+                            off_s = max(period_s - pw_s, 0.0)
+                            num_pulses = int(self.time_window_us / 1e6 / period_s)
+                            self.trigger_out.blink(on_time=pw_s, off_time=off_s, n=num_pulses)
+
+                        # Reset rolling state: this slice fully consumed
+                        self._window_start_ts = None
+                        self._events_in_window = 0
+                    else:
+                        # Accumulate slices until the window size is
+                        # exceeded.
                         if self._window_start_ts is None:
-                            self._window_start_ts = evs_sorted_ts[0]
+                            self._window_start_ts = evs["t"][0]
                             self._events_in_window = 0
 
-                        # If still within the current window, accumulate
-                        if (evs_sorted_ts[-1] - self._window_start_ts) <= self.time_window_us:
-                            # NOTE: This dismisses packets that lay in between
-                            # windows in favour of processing speed
-                            self._events_in_window += evs.size
-                        else:
-                            # Window completed: evaluate spike count and
-                            # optionally drive a trigger pulse.
+                        # Add this slice's events to the current window
+                        self._events_in_window += evs.size
+
+                        # If the combined span from window start to the
+                        # last event in this slice exceeds the window
+                        # length, the window is complete.
+                        if (evs["t"][-1] - self._window_start_ts) >= self.time_window_us:
                             trig = self.trigger_logic(self._events_in_window)
+                            # Debug log of window evaluation
+                            try:
+                                self.log_message(
+                                    f"Trigger window (accumulated): count={self._events_in_window}, trig={trig}, freq={self.frequency}"
+                                )
+                            except Exception:
+                                pass
                             if trig and self.frequency > 0:
                                 period_s = 1.0 / float(self.frequency)
-                                # Convert pulse width from µs to seconds
                                 pw_s = max(float(self.pulse_width) / 1e6, 0.0)
                                 off_s = max(period_s - pw_s, 0.0)
-                                # Fill window with pulses at f
                                 num_pulses = int(self.time_window_us / 1e6 / period_s)
                                 self.trigger_out.blink(on_time=pw_s, off_time=off_s, n=num_pulses)
 
-                            # Start a new window anchored at this event
+                                level = self._get_trigger_level_for_freq(self.frequency)
+                                if level is not None:
+                                    self._log_trigger_event(level)
+
+                            # Start a new window on a future slice
                             self._window_start_ts = None
                             self._events_in_window = 0
 
@@ -743,6 +865,19 @@ class CameraIOApp:
         self._robot_connecting = False
         self._robot_connect_timeout_ms = 5000
 
+        # Matplotlib figure for trigger level plot (right-hand side)
+        self.trigger_fig: Figure | None = None
+        self.trigger_ax = None
+        self.slice_ax = None
+        self.trigger_canvas: FigureCanvasTkAgg | None = None
+
+        # Plot refresh interval in milliseconds (lower = more CPU).
+        # Tkinter's after() requires an integer number of milliseconds; using
+        # a float here causes the callback scheduling to fail silently and the
+        # plot never refreshes beyond the first draw.
+        plot_refresh_hz = 3
+        self.plot_refresh_ms = int(1000 / plot_refresh_hz)
+
         # Optional Prophesee event display window (owned by main thread)
         self.event_window: MTWindow | None = None
 
@@ -788,6 +923,9 @@ class CameraIOApp:
 
         self.save_meta_button = tk.Button(master, text="Save Meta", command=self.on_save_robot_meta, width=12)
         self.save_meta_button.grid(row=4, column=2, padx=10, pady=5, sticky="w")
+
+        # Trigger level plot (time vs. discrete trigger level)
+        self._init_trigger_plot()
 
         # Display box for current robot meta data (right side)
         self.robot_meta_text = tk.Text(master, width=40, height=6, state="disabled")
@@ -854,6 +992,43 @@ class CameraIOApp:
 
         # Ensure window close via titlebar also performs a safe shutdown
         self.master.protocol("WM_DELETE_WINDOW", self.on_shutdown)
+
+        # Periodic plotting of recent trigger events
+        self._update_trigger_plot()
+    
+    def _init_trigger_plot(self):
+        """Create matplotlib figure embedded on the right-hand side for triggers."""
+        try:
+            # Wider figure with vertically stacked subplots
+            self.trigger_fig = Figure(figsize=(5, 4), dpi=100)
+            # Two subplots: top for trigger levels, bottom for evs.size debug
+            self.trigger_ax = self.trigger_fig.add_subplot(2, 1, 1)
+            self.slice_ax = self.trigger_fig.add_subplot(2, 1, 2, sharex=self.trigger_ax)
+
+            # Configure static plot properties for trigger subplot
+            self.trigger_ax.set_ylim(-0.5, 2.5)
+            self.trigger_ax.set_yticks([0, 1, 2])
+            self.trigger_ax.set_yticklabels(["Low", "Mid", "High"])
+            self.trigger_ax.set_xlim(0.0, 5.0)
+            self.trigger_ax.set_xlabel("")
+            self.trigger_ax.set_ylabel("Trigger level")
+
+            # Configure debug subplot for slice event counts
+            self.slice_ax.set_xlabel("Time (s)")
+            self.slice_ax.set_ylabel("Events per slice")
+
+            self.trigger_canvas = FigureCanvasTkAgg(self.trigger_fig, master=self.master)
+            widget = self.trigger_canvas.get_tk_widget()
+            # Place on the far right, spanning most of the UI height
+            widget.grid(row=0, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
+        except Exception:
+            # If matplotlib is unavailable, leave plot uninitialized
+            self.trigger_fig = None
+            self.trigger_ax = None
+            self.slice_ax = None
+            self.trigger_canvas = None
+
+    # UI callbacks
 
     # UI callbacks
     def on_shutdown(self):
@@ -1421,6 +1596,117 @@ class CameraIOApp:
         # Schedule next poll
         try:
             self.master.after(200, self._poll_logs)
+        except Exception:
+            pass
+
+    def _update_trigger_plot(self):
+        """Refresh the trigger level scatter plot.
+
+        X-axis shows elapsed time in seconds since the camera was connected,
+        while only events from the last 5 seconds are displayed.
+        """
+        try:
+            fig = self.trigger_fig
+            ax_trig = self.trigger_ax
+            ax_slice = self.slice_ax
+            canvas = self.trigger_canvas
+        except Exception:
+            fig = None
+            ax_trig = None
+            ax_slice = None
+            canvas = None
+
+        if fig is not None and ax_trig is not None and canvas is not None:
+            try:
+                events = self.io.get_trigger_events()
+                # Debug slice event counts (timestamp_s, count)
+                try:
+                    slice_events = self.io.get_slice_event_counts()
+                except Exception:
+                    slice_events = []
+                cam_start = self.io.get_camera_start_time()
+            except Exception:
+                events = []
+                slice_events = []
+                cam_start = None
+
+            if cam_start is not None:
+                now_s = time.monotonic()
+
+                # Overall elapsed time since camera connect
+                total_elapsed = max(now_s - cam_start, 0.0)
+
+                # X-axis window: [0, total_elapsed] while < 5s, then [t-5, t]
+                if total_elapsed <= 5.0:
+                    x_min = 0.0
+                    x_max = max(total_elapsed, 1e-3)
+                else:
+                    x_max = total_elapsed
+                    x_min = total_elapsed - 5.0
+
+                xs = []
+                ys = []
+                for t_s, level in events:
+                    # Absolute elapsed time since camera connection
+                    elapsed = t_s - cam_start
+                    if elapsed < x_min or elapsed > x_max:
+                        continue
+                    xs.append(elapsed)
+                    ys.append(level)
+
+                try:
+                    # Trigger-level subplot
+                    ax_trig.clear()
+                    ax_trig.set_ylim(-0.5, 2.5)
+                    ax_trig.set_yticks([0, 1, 2])
+                    ax_trig.set_yticklabels(["Low", "Mid", "High"])
+                    ax_trig.set_xlim(x_min, x_max)
+                    ax_trig.set_ylabel("Trigger level")
+
+                    if xs and ys:
+                        ax_trig.scatter(
+                            xs,
+                            ys,
+                            c="tab:red",
+                            s=60,
+                            marker="o",
+                            edgecolors="black",
+                            linewidths=0.5,
+                            alpha=0.9,
+                        )
+
+                    # Debug subplot: events per slice as a simple line plot
+                    if ax_slice is not None:
+                        ax_slice.clear()
+                        slice_xs = []
+                        slice_ys = []
+                        for t_s, count in slice_events:
+                            elapsed = t_s - cam_start
+                            if elapsed < x_min or elapsed > x_max:
+                                continue
+                            slice_xs.append(elapsed)
+                            slice_ys.append(count)
+
+                        ax_slice.set_xlim(x_min, x_max)
+                        # Fix y-axis to [0, high_spike_threshold] for clarity
+                        try:
+                            y_max = max(float(self.io.high_spike_threshold), 1.0)
+                        except Exception:
+                            y_max = 1.0
+                        ax_slice.set_ylim(0.0, y_max)
+                        ax_slice.set_xlabel("Time (s)")
+                        ax_slice.set_ylabel("Events per slice")
+
+                        if slice_xs and slice_ys:
+                            ax_slice.plot(slice_xs, slice_ys, "-o", markersize=3)
+
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+
+        # Schedule next refresh at a lower rate to reduce CPU usage
+        try:
+            self.master.after(self.plot_refresh_ms, self._update_trigger_plot)
         except Exception:
             pass
 
