@@ -1,4 +1,4 @@
-from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox, Frame, Radiobutton
+from tkinter import Tk, Button, Checkbutton, IntVar, Label, StringVar, Text, Entry, END, DISABLED, NORMAL, messagebox, Frame, Radiobutton, Scrollbar, Canvas
 from datetime import datetime
 from stim_io import UART_COMMS
 import uart_protocol
@@ -24,6 +24,8 @@ class AppUI:
         self.pending_stim_frequency = 0.00
         self.pending_burst_length = 0.00
         self.nerve_impedance = 0.00
+        # UI limits
+        self._max_amp_ua = 10.0
         # Runtime state flags for control logic
         self.interlocks_on = None  # True when engaged; False when disengaged; None unknown
         self.stim_on = None        # True when stimulation active; False when inactive; None unknown
@@ -159,21 +161,51 @@ class AppUI:
                     command=self.toggle_pc_user, state=DISABLED)
         self.pc_mode_pc_radio.pack(anchor="center", padx=10, pady=1)
 
-        # Show/hide debug log toggle (place below log box, bottom-left)
+        # Show/hide debug log toggle and bottom log bar
         self.show_debug_var = IntVar()
         self.show_debug_var.set(1)
-        # Event log on right-hand side
-        self.event_log = Text(master, width=60, height=20)
-        self.event_log.grid(row=1, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
-        # Place Show Debug under the log box, bottom-left corner
-        self.show_debug_check = Checkbutton(master, text="Show Debug",
+        # Configure columns to allow bottom bar to stretch
+        try:
+            for c in range(0, 5):
+                self.master.grid_columnconfigure(c, weight=1)
+        except Exception:
+            pass
+        # Bottom log frame spanning full width
+        self.log_frame = Frame(master)
+        self.log_frame.grid(row=15, column=0, columnspan=5, padx=10, pady=(0, 10), sticky="ew")
+        try:
+            self.log_frame.grid_columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        # Event log as a thin, scrollable bar
+        self.event_log = Text(self.log_frame, height=4, wrap="word")
+        self.event_log.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.log_scroll = Scrollbar(self.log_frame, orient="vertical", command=self.event_log.yview)
+        self.log_scroll.grid(row=0, column=1, sticky="ns")
+        try:
+            self.event_log.configure(yscrollcommand=self.log_scroll.set)
+        except Exception:
+            pass
+        # Show Debug toggle aligned to the right of the bar
+        self.show_debug_check = Checkbutton(self.log_frame, text="Show Debug",
                     variable=self.show_debug_var,
                     command=self.toggle_debug)
-        self.show_debug_check.grid(row=14, column=4, padx=10, pady=(0, 10), sticky="w")
+        self.show_debug_check.grid(row=0, column=2, padx=(8, 0), sticky="e")
 
         # Shutdown button (upper-right)
         self.shutdown_but = Button(master, text="Shutdown", command=self.shutdown_system, width=12, height=2)
         self.shutdown_but.grid(row=0, column=4, padx=10, pady=10)
+
+        # Right-side plot area (replaces former right-side log)
+        self.plot_frame = Frame(master)
+        self.plot_frame.grid(row=1, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
+        try:
+            self.plot_frame.grid_rowconfigure(0, weight=1)
+            self.plot_frame.grid_columnconfigure(0, weight=1)
+        except Exception:
+            pass
+        self.plot_canvas = Canvas(self.plot_frame, background="#ffffff", height=300, width=420, highlightthickness=1, highlightbackground="#cccccc")
+        self.plot_canvas.grid(row=0, column=0, sticky="nsew")
 
         # Initialize serial communication
         # We no longer use saved serial numbers. Control board is on a fixed UART port,
@@ -215,6 +247,11 @@ class AppUI:
         self.log_event(f"Seeking control board on {self.control_board_serial}...")
         self.start_auto_connect()
         # self.initialise_user_board()
+        # Initial plot render
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def connect_control_board(self):
         # Backward-compatible entrypoint: kick off non-blocking auto-connect
@@ -459,6 +496,10 @@ class AppUI:
                             label = "Control Receipt: Update Width"
                         elif mt == getattr(M, 'UART_MSG_UPDATE_AMP', None):
                             label = "Control Receipt: Update Amplitude"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_FREQ', None):
+                            label = "Control Receipt: Update Frequency"
+                        elif mt == getattr(M, 'UART_MSG_UPDATE_BURST', None):
+                            label = "Control Receipt: Update Burst Length"
                         elif mt == getattr(M, 'UART_MSG_SHUTDOWN', None):
                             label = "Control Receipt: Shutdown"
                     except Exception:
@@ -577,6 +618,10 @@ class AppUI:
                             self.pending_pulse_width = float(width)
                             self.pulse_width_var.set(f"Pulse Width: {self.pulse_width:.2f}")
                             self.log_event(f"Control board width updated: {width}")
+                            try:
+                                self.update_plot()
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -584,10 +629,21 @@ class AppUI:
                     amp = ev.get("amp")
                     if amp is not None:
                         try:
-                            self.stim_amplitude = float(amp)
-                            self.pending_stim_amplitude = float(amp)
+                            recv_amp = float(amp)
+                            # Reflect UI policy: cap at max for display/pending
+                            if recv_amp > self._max_amp_ua:
+                                self.log_event(f"Control board reported amplitude {recv_amp:.2f}uA; capping display to {self._max_amp_ua:.2f}uA")
+                                recv_amp = self._max_amp_ua
+                            if recv_amp < 0.0:
+                                recv_amp = 0.0
+                            self.stim_amplitude = recv_amp
+                            self.pending_stim_amplitude = recv_amp
                             self.stim_amplitude_var.set(f"Stim Amplitude: {self.stim_amplitude:.2f}uA")
                             self.log_event(f"Control board amplitude updated: {self.stim_amplitude:.2f}uA")
+                            try:
+                                self.update_plot()
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -604,6 +660,10 @@ class AppUI:
                             except Exception:
                                 pass
                             self.log_event(f"Control board frequency updated: {self.stim_frequency} Hz")
+                            try:
+                                self.update_plot()
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -653,29 +713,160 @@ class AppUI:
         """Show or hide the debug log panel based on the Show Debug toggle."""
         try:
             if self.show_debug_var.get():
-                self.event_log.grid(row=1, column=4, rowspan=13, padx=10, pady=10, sticky="nsew")
+                # Show only the log content; keep checkbox always visible
+                try:
+                    self.event_log.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+                except Exception:
+                    pass
+                try:
+                    self.log_scroll.grid(row=0, column=1, sticky="ns")
+                except Exception:
+                    pass
             else:
-                self.event_log.grid_remove()
+                # Hide the log content but leave the frame and checkbox visible
+                try:
+                    self.event_log.grid_remove()
+                except Exception:
+                    pass
+                try:
+                    self.log_scroll.grid_remove()
+                except Exception:
+                    pass
         except Exception:
             pass
 
+    def update_plot(self):
+        """Render two square-wave pulses on the right-side canvas.
+        X axis: time (s), Y axis: stim amplitude (uA).
+        Two pulses each of width `pending_pulse_width`, amplitude `pending_stim_amplitude`,
+        separated by a gap of 1/`pending_stim_frequency`.
+        """
+        canvas = getattr(self, "plot_canvas", None)
+        if not canvas:
+            return
+
+        # Clear previous drawing
+        try:
+            canvas.delete("all")
+        except Exception:
+            return
+
+        # Fetch parameters (use pending so user sees edits immediately)
+        try:
+            amp = float(getattr(self, "pending_stim_amplitude", 0.0) or 0.0)
+        except Exception:
+            amp = 0.0
+        try:
+            width = float(getattr(self, "pending_pulse_width", 0.0) or 0.0)
+        except Exception:
+            width = 0.0
+        try:
+            freq = float(getattr(self, "pending_stim_frequency", 0.0) or 0.0)
+        except Exception:
+            freq = 0.0
+
+        # Guard and defaults
+        if width < 0:
+            width = 0.0
+        gap = 1.0 / freq if freq and freq > 0 else max(1.0, width)
+
+        # Time domain: first pulse [0, width], gap, second pulse [width+gap, width+gap+width]
+        t0 = 0.0
+        t1 = width
+        t2 = width + gap
+        t3 = width + gap + width
+        t_max = max(t3, 1.0)
+
+        # Canvas size
+        try:
+            W = int(canvas.winfo_width()) or 420
+            H = int(canvas.winfo_height()) or 300
+        except Exception:
+            W, H = 420, 300
+
+        # Margins
+        L, R, T, B = 40, 10, 10, 30
+        plot_w = max(1, W - L - R)
+        plot_h = max(1, H - T - B)
+
+        # Axes and labels
+        x0, y0 = L, H - B
+        x1, y1 = W - R, T
+        canvas.create_rectangle(x0, y1, x1, y0, outline="#999999")
+        canvas.create_text((x0 + x1) // 2, H - 8, text="Time (s)", fill="#333333", font=("TkDefaultFont", 9))
+        canvas.create_text(14, (y1 + y0) // 2, text="uA", fill="#333333", angle=90, font=("TkDefaultFont", 9))
+
+        # Scaling functions
+        def x_to_px(t):
+            return x0 + (0 if t_max == 0 else (t / t_max) * plot_w)
+
+        # Fixed Y-axis at 10uA
+        y_max = 10.0
+        def y_to_px(v):
+            return y0 - (0 if y_max == 0 else (v / y_max) * plot_h)
+
+        # Draw baseline
+        canvas.create_line(x_to_px(0), y_to_px(0), x_to_px(t_max), y_to_px(0), fill="#bbbbbb")
+
+        # Draw pulses as filled rectangles
+        fill_col = "#4a90e2"
+        outline_col = "#2c66a8"
+        if width > 0 and amp > 0:
+            # First pulse
+            canvas.create_rectangle(x_to_px(t0), y_to_px(0), x_to_px(t1), y_to_px(amp), outline=outline_col, fill=fill_col)
+            # Second pulse
+            canvas.create_rectangle(x_to_px(t2), y_to_px(0), x_to_px(t3), y_to_px(amp), outline=outline_col, fill=fill_col)
+
+        # Simple ticks (3 ticks for time, 3 for amplitude)
+        for i in range(4):
+            tx = i * (t_max / 3.0)
+            px = x_to_px(tx)
+            canvas.create_line(px, y0, px, y0 + 4, fill="#666666")
+            canvas.create_text(px, y0 + 12, text=f"{tx:.2f}", fill="#444444", font=("TkDefaultFont", 8))
+
+        for i in range(4):
+            tv = i * (y_max / 3.0)
+            py = y_to_px(tv)
+            canvas.create_line(x0 - 4, py, x0, py, fill="#666666")
+            canvas.create_text(x0 - 8, py, text=f"{tv:.0f}", fill="#444444", font=("TkDefaultFont", 8), anchor="e")
+
     def stim_amp_up(self):
         self.pending_stim_amplitude += 1.00
+        if self.pending_stim_amplitude > self._max_amp_ua:
+            self.pending_stim_amplitude = self._max_amp_ua
         self.stim_amplitude_var.set(f"Stim Amplitude: {self.pending_stim_amplitude:.2f}uA")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def stim_amp_down(self):
         self.pending_stim_amplitude -= 1.00
+        if self.pending_stim_amplitude < 0.0:
+            self.pending_stim_amplitude = 0.0
         self.stim_amplitude_var.set(f"Stim Amplitude: {self.pending_stim_amplitude:.2f}uA")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def pulse_width_up(self):
         self.pending_pulse_width += 1.00
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def pulse_width_down(self):
         self.pending_pulse_width -= 1.00
         if self.pending_pulse_width < 0:
             self.pending_pulse_width = 0
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def stim_freq_up(self):
         """Increase pending stimulation frequency and update entry."""
@@ -683,6 +874,10 @@ class AppUI:
         try:
             self.stim_freq_entry.delete(0, END)
             self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+        except Exception:
+            pass
+        try:
+            self.update_plot()
         except Exception:
             pass
 
@@ -694,6 +889,10 @@ class AppUI:
         try:
             self.stim_freq_entry.delete(0, END)
             self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+        except Exception:
+            pass
+        try:
+            self.update_plot()
         except Exception:
             pass
 
@@ -724,6 +923,12 @@ class AppUI:
         being sent to the control board so that all parameters on the wire
         are integer or float32 scalars as defined by the protocol.
         """
+        # Clamp amplitude before applying
+        if self.pending_stim_amplitude > self._max_amp_ua:
+            self.log_event(f"Amplitude request exceeds limit; clipping to {self._max_amp_ua:.2f}uA")
+            self.pending_stim_amplitude = self._max_amp_ua
+        if self.pending_stim_amplitude < 0.0:
+            self.pending_stim_amplitude = 0.0
         self.stim_amplitude = self.pending_stim_amplitude
         self.pulse_width = self.pending_pulse_width
         # Normalise frequency and burst length to integer values for transport
@@ -741,6 +946,10 @@ class AppUI:
             f"Pulse Width = {self.pulse_width:.2f}, Freq = {self.stim_frequency} Hz, "
             f"Burst = {self.burst_length} us"
         )
+        try:
+            self.update_plot()
+        except Exception:
+            pass
         if not self.control_uart:
             self.log_event("Cannot apply settings: control board not connected.")
             return
@@ -748,7 +957,14 @@ class AppUI:
             # Send width (int), amplitude (float), frequency (int), and burst (int)
             # to the control board. Frequency and burst are sent as INT32 payloads.
             self.control_uart.set_pulse_width(self.pulse_width)
-            self.control_uart.set_stim_amplitude(self.stim_amplitude)
+            # Final guard before sending
+            send_amp = self.stim_amplitude
+            if send_amp > self._max_amp_ua:
+                self.log_event(f"Safety check: capping amplitude to {self._max_amp_ua:.2f}uA before send")
+                send_amp = self._max_amp_ua
+            if send_amp < 0.0:
+                send_amp = 0.0
+            self.control_uart.set_stim_amplitude(send_amp)
             self.control_uart.set_stim_frequency(self.stim_frequency)
             self.control_uart.set_burst_length(self.burst_length)
             self.log_event("Settings sent to control board.")
@@ -952,10 +1168,19 @@ class AppUI:
         """Update the pending stimulation amplitude from the entry box."""
         try:
             value = float(self.stim_amplitude_entry.get())
+            # Clamp to [0, max]
+            if value < 0.0:
+                value = 0.0
+            if value > self._max_amp_ua:
+                value = self._max_amp_ua
             self.pending_stim_amplitude = value
             self.stim_amplitude_var.set(f"Stim Amplitude: {self.pending_stim_amplitude:.2f}uA")
         except ValueError:
             self.log_event("Invalid input for Stimulation Amplitude")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def update_pulse_width(self, event):
         """Update the pending pulse width from the entry box."""
@@ -965,6 +1190,10 @@ class AppUI:
             self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
         except ValueError:
             self.log_event("Invalid input for Pulse Width")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def update_stim_freq(self, event):
         """Update the pending stimulation frequency from the entry box."""
@@ -973,6 +1202,10 @@ class AppUI:
             self.pending_stim_frequency = value
         except ValueError:
             self.log_event("Invalid input for Stim Frequency")
+        try:
+            self.update_plot()
+        except Exception:
+            pass
 
     def update_burst_len(self, event):
         """Update the pending burst length from the entry box."""
