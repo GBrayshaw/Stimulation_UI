@@ -183,6 +183,13 @@ class AppUI:
         self.control_uart = None
         self.user_board = None
 
+        # USB serial link to peer UI (other Raspberry Pi)
+        # Default device path may need to be adjusted per system.
+        self.peer_ui_serial = "/dev/ttyUSB0"
+        self.peer_ui_baudrate = getattr(uart_protocol, "CONTROL_BOARD_UART_BAUD_RATE", 9600)
+        self.peer_ui_ser = None
+        self._peer_ui_connected = False
+
         self.pc_usr_toggle = 1
         # Heartbeat monitoring
         self._hb_timeout_ms = getattr(uart_protocol, 'HEARTBEAT_TIMEOUT_MS', 300)
@@ -254,6 +261,15 @@ class AppUI:
                 # completing its own startup/READY sequence.
                 self._hb_warmup_until = time.monotonic() + 8.0
                 self._schedule_heartbeat_monitor()
+
+                # After the control-board link is up, attempt to connect to
+                # the peer UI over the USB serial link using a simple
+                # ACK-based handshake defined by uart_protocol.
+                try:
+                    self.connect_peer_ui()
+                except Exception:
+                    # Any errors are logged inside connect_peer_ui; continue.
+                    pass
                 return
             else:
                 # Not connected yet; retry
@@ -1232,6 +1248,16 @@ class AppUI:
         finally:
             self.user_board = None
 
+        # Close peer-UI USB link if present
+        try:
+            if self.peer_ui_ser and getattr(self.peer_ui_ser, "is_open", False):
+                self.peer_ui_ser.close()
+        except Exception:
+            pass
+        finally:
+            self.peer_ui_ser = None
+            self._peer_ui_connected = False
+
         # Send SHUTDOWN, stop UART threads, and close serial if present
         try:
             if self.control_uart:
@@ -1332,6 +1358,176 @@ class AppUI:
             self.user_board = None
             self.pc_user_switch.config(state=DISABLED)
             self.reconnect_user_but.config(state=NORMAL)
+
+    def _compute_peer_crc(self, msg_type: int, payload_type: int, payload_bytes: bytes) -> int:
+        crc = msg_type ^ payload_type ^ len(payload_bytes)
+        for b in payload_bytes:
+            crc ^= b
+        return crc & 0xFF
+
+    def _read_peer_packet(self, timeout_s: float = 0.5):
+        """Read a single framed UART packet from the peer-UI link.
+
+        This mirrors the framing used elsewhere in the system
+        (UART_START_BYTE / UART_END_BYTE with CRC) but is scoped to
+        the simple ACK-based handshake for the USB link between the
+        two UIs.
+        """
+        if not self.peer_ui_ser or not getattr(self.peer_ui_ser, "is_open", False):
+            return None
+
+        start_byte = getattr(uart_protocol, "UART_START_BYTE", None)
+        end_byte = getattr(uart_protocol, "UART_END_BYTE", None)
+        if start_byte is None or end_byte is None:
+            return None
+
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            start = self.peer_ui_ser.read(1)
+            if not start or start[0] != start_byte:
+                continue
+
+            header = self.peer_ui_ser.read(3)
+            if len(header) != 3:
+                continue
+            msg_type, payload_type, length = header
+
+            payload = self.peer_ui_ser.read(length)
+            if len(payload) != length:
+                continue
+
+            tail = self.peer_ui_ser.read(2)
+            if len(tail) != 2:
+                continue
+            crc_rx, end = tail
+            if end != end_byte:
+                continue
+
+            if self._compute_peer_crc(msg_type, payload_type, payload) != crc_rx:
+                continue
+
+            return msg_type, payload_type, payload
+        return None
+
+    def connect_peer_ui(self, overall_timeout_s: float = 1.0, resend_interval_s: float = 0.25) -> bool:
+        """Connect to the peer UI over USB serial and perform an ACK handshake.
+
+        Uses uart_protocol framing with MODE.UART_MSG_ACK and PAYLOAD_NONE
+        so both UIs can confirm that they see each other's connection.
+        """
+        if not self.peer_ui_serial:
+            return False
+
+        # If already connected and port is open, treat as success
+        if self.peer_ui_ser is not None and getattr(self.peer_ui_ser, "is_open", False):
+            self._peer_ui_connected = True
+            return True
+
+        try:
+            self.log_event(f"Attempting peer-UI USB link on {self.peer_ui_serial}...")
+        except Exception:
+            pass
+
+        try:
+            self.peer_ui_ser = serial.Serial(
+                port=self.peer_ui_serial,
+                baudrate=self.peer_ui_baudrate,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                bytesize=serial.EIGHTBITS,
+                timeout=0.2,
+            )
+        except Exception as e:
+            try:
+                self.log_event(f"Peer-UI link failed: unable to open {self.peer_ui_serial}: {e}")
+            except Exception:
+                pass
+            self.peer_ui_ser = None
+            self._peer_ui_connected = False
+            return False
+
+        # Build a bare ACK packet for handshake
+        try:
+            MODE = uart_protocol.MODE
+            PAYLOAD_TYPE = uart_protocol.PAYLOAD_TYPE
+            start_byte = uart_protocol.UART_START_BYTE
+            end_byte = uart_protocol.UART_END_BYTE
+        except Exception:
+            # If protocol constants are unavailable, close and abort
+            try:
+                self.peer_ui_ser.close()
+            except Exception:
+                pass
+            self.peer_ui_ser = None
+            self._peer_ui_connected = False
+            return False
+
+        msg_type = MODE.UART_MSG_ACK
+        payload_type = PAYLOAD_TYPE.PAYLOAD_NONE
+        payload = b""
+        length = len(payload)
+        crc = self._compute_peer_crc(msg_type, payload_type, payload)
+
+        ack_pkt = bytearray()
+        ack_pkt.append(start_byte)
+        ack_pkt.append(msg_type)
+        ack_pkt.append(payload_type)
+        ack_pkt.append(length)
+        ack_pkt.extend(payload)
+        ack_pkt.append(crc)
+        ack_pkt.append(end_byte)
+        ack_pkt = bytes(ack_pkt)
+
+        start_time = time.monotonic()
+        last_send = start_time
+
+        try:
+            while (time.monotonic() - start_time) < overall_timeout_s:
+                # Try to read a packet from the peer
+                pkt = None
+                try:
+                    pkt = self._read_peer_packet(timeout_s=0.2)
+                except Exception:
+                    pkt = None
+
+                if pkt and pkt[0] == MODE.UART_MSG_ACK:
+                    # Echo ACK back so the peer can also confirm the link
+                    try:
+                        self.peer_ui_ser.write(ack_pkt)
+                    except Exception:
+                        pass
+                    self._peer_ui_connected = True
+                    try:
+                        self.log_event(f"Peer-UI handshake complete on {self.peer_ui_serial}.")
+                    except Exception:
+                        pass
+                    return True
+
+                now = time.monotonic()
+                if (now - last_send) >= resend_interval_s:
+                    try:
+                        self.peer_ui_ser.write(ack_pkt)
+                    except Exception:
+                        pass
+                    last_send = now
+
+                time.sleep(0.05)
+        except Exception:
+            pass
+
+        # Handshake failed; close link
+        try:
+            self.log_event(f"Peer-UI handshake failed on {self.peer_ui_serial}.")
+        except Exception:
+            pass
+        try:
+            if self.peer_ui_ser and getattr(self.peer_ui_ser, "is_open", False):
+                self.peer_ui_ser.close()
+        except Exception:
+            pass
+        self.peer_ui_ser = None
+        self._peer_ui_connected = False
+        return False
 
     def uart_handshake(self):
         """Send a short handshake (<ACK>) over UART and return the raw response bytes.

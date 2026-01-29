@@ -148,6 +148,35 @@ class IO2Pulse:
             crc ^= b
         return crc & 0xFF
 
+    def _send_ack(self):
+        """Send a bare ACK packet over the Pi-to-Pi UART link.
+
+        Used both for shutdown acknowledgement and for simple handshake
+        with the peer UI. Safe to call even if the serial link is down.
+        """
+        if not self.ser or not getattr(self.ser, "is_open", False):
+            return
+
+        msg_type = MODE.UART_MSG_ACK
+        payload_type = PAYLOAD_TYPE.PAYLOAD_NONE
+        payload = b""
+        length = len(payload)
+        crc = self._compute_crc(msg_type, payload_type, payload)
+
+        pkt = bytearray()
+        pkt.append(UART_START_BYTE)
+        pkt.append(msg_type)
+        pkt.append(payload_type)
+        pkt.append(length)
+        pkt.extend(payload)
+        pkt.append(crc)
+        pkt.append(UART_END_BYTE)
+
+        try:
+            self.ser.write(bytes(pkt))
+        except Exception:
+            pass
+
     # ----------------------------
     # Logging helpers
     # ----------------------------
@@ -287,11 +316,21 @@ class IO2Pulse:
                     self.use_external_triggers = False
                      # remain in current safe-state setting
                     self.log_message("Received TRIG_INTERNAL: disabling external triggers.")
-                elif msg_type == MODE.UART_MSG_ACK and self._awaiting_ack:
-                    # ACK received: exit the shutdown safe-wait state
-                    self._awaiting_ack = False
-                    self.in_safe_state = False
-                    self.log_message("Received ACK: leaving safe shutdown state.")
+                elif msg_type == MODE.UART_MSG_ACK:
+                    if self._awaiting_ack:
+                        # ACK received: exit the shutdown safe-wait state
+                        self._awaiting_ack = False
+                        self.in_safe_state = False
+                        self.log_message("Received ACK: leaving safe shutdown state.")
+                    else:
+                        # Treat ACK as a handshake probe from the peer Pi:
+                        # echo an ACK back using the same framed protocol so
+                        # the other side can confirm that this link is alive.
+                        try:
+                            self._send_ack()
+                            self.log_message("Received handshake ACK from peer Pi; echoed ACK back.")
+                        except Exception:
+                            pass
                 elif msg_type == MODE.UART_MSG_UPDATE_WIDTH:
                     width = None
                     try:
