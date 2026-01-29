@@ -54,7 +54,7 @@ class IO2Pulse:
         self.low_frequency = 200    # Hardcoded frequencies of stimulation 
         self.mid_frequency = 500
         self.high_frequency = 1000
-        self.frequency = self.high_frequency    # in Hz NOTE: SET TO 0 AFTER TESTING
+        self.frequency = self.high_frequency       # NOTE: SET TO 0 AFTER TESTING              # in Hz
 
         # Spike encoding parameters
         self.high_spike_threshold = 20000  # Spike rates for trigger logic
@@ -442,6 +442,8 @@ class IO2Pulse:
         with self._state_lock:
             self.frequency = int(freq)
             current = self.frequency
+        # Log outside the lock
+        self.log_message(f"Frequency updated to {current} Hz.")
 
     # Connection status helpers
     def is_camera_connected(self) -> bool:
@@ -617,6 +619,13 @@ class IO2Pulse:
                         # window: evaluate a window using only the events
                         # from this slice.
                         trig = self.trigger_logic(evs.size)
+                        # Debug log of window evaluation
+                        try:
+                            self.log_message(
+                                f"Trigger window (single slice): count={evs.size}, trig={trig}, freq={self.frequency}"
+                            )
+                        except Exception:
+                            pass
 
                         if trig and self.frequency > 0:
                             # Plot in trigger plot
@@ -649,7 +658,13 @@ class IO2Pulse:
                         # length, the window is complete.
                         if (evs["t"][-1] - self._window_start_ts) >= self.time_window_us:
                             trig = self.trigger_logic(self._events_in_window)
-
+                            # Debug log of window evaluation
+                            try:
+                                self.log_message(
+                                    f"Trigger window (accumulated): count={self._events_in_window}, trig={trig}, freq={self.frequency}"
+                                )
+                            except Exception:
+                                pass
                             if trig and self.frequency > 0:
                                 period_s = 1.0 / float(self.frequency)
                                 pw_s = max(float(self.pulse_width) / 1e6, 0.0)
