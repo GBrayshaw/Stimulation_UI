@@ -298,15 +298,6 @@ class AppUI:
                 # completing its own startup/READY sequence.
                 self._hb_warmup_until = time.monotonic() + 8.0
                 self._schedule_heartbeat_monitor()
-
-                # After the control-board link is up, attempt to connect to
-                # the peer UI over the USB serial link using a simple
-                # ACK-based handshake defined by uart_protocol.
-                try:
-                    self.connect_peer_ui()
-                except Exception:
-                    # Any errors are logged inside connect_peer_ui; continue.
-                    pass
                 return
             else:
                 # Not connected yet; retry
