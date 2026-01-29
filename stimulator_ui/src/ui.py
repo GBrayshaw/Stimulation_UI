@@ -8,7 +8,6 @@ import serial.tools.list_ports
 import os
 import subprocess
 import time
-import threading
 
 class AppUI:
     def __init__(self, master):
@@ -244,9 +243,6 @@ class AppUI:
         self._mode_resend_interval_ms = 2000
         self._mode_resend_id = None
 
-        # Background connect worker state for non-blocking reconnects
-        self._connect_worker_running = False
-
         # Start UI immediately and begin seeking the control board
         self.log_event(f"Seeking control board on {self.control_board_serial}...")
         self.start_auto_connect()
@@ -278,105 +274,44 @@ class AppUI:
         self._connect_after_id = self.master.after(10, self._connect_step)
 
     def _connect_step(self):
-        """Kick off or monitor a background UART connect/handshake attempt.
-
-        The actual serial open + handshake is performed in a worker thread
-        to avoid blocking the Tk main loop. This method is scheduled via
-        after() to poll for completion and schedule retries.
-        """
         self._connect_after_id = None
-
-        # If a worker is already running, just reschedule a status check
-        if self._connect_worker_running:
-            self._connect_after_id = self.master.after(self._connect_retry_ms, self._connect_step)
-            return
-
         if not self.control_board_serial:
             self.log_event("Control board serial port not set. Please edit the code to set the port.")
             self.disable_uart_controls()
-            try:
-                self.reconnect_but.config(state=NORMAL)
-            except Exception:
-                pass
             return
-
-        def worker(attempt_idx: int):
-            uart = None
-            ok = False
-            err = None
-            try:
-                # Either reuse existing UART_COMMS or create a fresh one
-                uart = self.control_uart or UART_COMMS(port=self.control_board_serial, baudrate=9600)
-                try:
-                    # Keep handshake short to avoid long stalls
-                    ok = uart.handshake(overall_timeout_s=0.5, resend_interval_s=0.25)
-                except Exception as e:  # noqa: BLE001
-                    err = e
-                    ok = False
-            except Exception as e:  # noqa: BLE001
-                err = e
-                uart = None
-
-            # Hand result back to Tk main loop
-            try:
-                self.master.after(0, lambda: self._on_connect_result(attempt_idx, uart, ok, err))
-            except Exception:
-                # If we cannot schedule back to Tk, close UART defensively
-                try:
-                    if uart:
-                        uart.close()
-                except Exception:
-                    pass
-            finally:
-                self._connect_worker_running = False
-
-        # Start a new worker attempt
-        self._connect_worker_running = True
-        attempt = self._connect_attempts
-        threading.Thread(target=worker, args=(attempt,), daemon=True).start()
-
-    def _on_connect_result(self, attempt_idx: int, uart: UART_COMMS | None, ok: bool, err: Exception | None):
-        """Handle completion of a background UART connect/handshake attempt."""
-        # If the window has been destroyed, do nothing
-        if not getattr(self, "master", None):
-            try:
-                if uart:
-                    uart.close()
-            except Exception:
-                pass
-            return
-
-        if ok and uart is not None:
-            # Successful connection
-            self.control_uart = uart
-            self.log_event(f"Control board connected on port {self.control_board_serial}.")
-            self.enable_uart_controls()
-            # Start heartbeat monitor
-            self._hb_tripped = False
-            # Start heartbeat monitor with an extended warmup to avoid
-            # flagging the link as dead while the stim board is still
-            # completing its own startup/READY sequence.
-            self._hb_warmup_until = time.monotonic() + 8.0
-            self._schedule_heartbeat_monitor()
-            # Leave reconnect disabled while connected
-            try:
-                self.reconnect_but.config(state=DISABLED)
-            except Exception:
-                pass
-            return
-
-        # Failure path: log once in a while and clean up UART
-        self._connect_attempts = attempt_idx + 1
-        if self._connect_attempts % 10 == 0:
-            self.log_event("Still seeking control board...")
-
         try:
-            if uart:
-                uart.close()
-        except Exception:
-            pass
-        self.control_uart = None
-
+            if self.control_uart is None:
+                self.control_uart = UART_COMMS(port=self.control_board_serial, baudrate=9600)
+            ok = False
+            try:
+                # Keep handshake short to avoid blocking the UI loop
+                ok = self.control_uart.handshake(overall_timeout_s=0.5, resend_interval_s=0.25)
+            except Exception as e:
+                ok = False
+            if ok:
+                self.log_event(f"Control board connected on port {self.control_board_serial}.")
+                self.enable_uart_controls()
+                # Start heartbeat monitor
+                self._hb_tripped = False
+                # Start heartbeat monitor with an extended warmup to avoid
+                # flagging the link as dead while the stim board is still
+                # completing its own startup/READY sequence.
+                self._hb_warmup_until = time.monotonic() + 8.0
+                self._schedule_heartbeat_monitor()
+                return
+            else:
+                # Not connected yet; retry
+                self._connect_attempts += 1
+                if self._connect_attempts % 10 == 0:
+                    self.log_event("Still seeking control board...")
+        except Exception as e:
+            # On failure, clean up and retry later
+            try:
+                if self.control_uart:
+                    self.control_uart.close()
+            except Exception:
+                pass
+            self.control_uart = None
         # Schedule next attempt
         self._connect_after_id = self.master.after(self._connect_retry_ms, self._connect_step)
 
