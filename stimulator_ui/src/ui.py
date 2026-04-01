@@ -79,6 +79,10 @@ class AppUI:
         self.stim_freq_label = Label(master, text="Stim Frequency (Hz)")
         # Align header with Stim Amplitude / Pulse Width headers
         self.stim_freq_label.grid(row=4, column=0, columnspan=2, padx=10, pady=(10, 0))
+        self.max_stim_freq_var = StringVar()
+        self.max_stim_freq_var.set("Max: — Hz")
+        self.max_stim_freq_label = Label(master, textvariable=self.max_stim_freq_var)
+        self.max_stim_freq_label.grid(row=4, column=2, padx=10, pady=(10, 0), sticky="w")
         self.stim_freq_entry = Entry(master, state=DISABLED)
         # Align box with Stim Amplitude / Pulse Width boxes (entry column)
         self.stim_freq_entry.grid(row=5, column=2, padx=10, pady=5)
@@ -249,6 +253,7 @@ class AppUI:
 
         # Start UI immediately and begin seeking the control board
         self.log_event(f"Seeking control board on {self.control_board_serial}...")
+        self._refresh_max_stim_freq_indicator()
         self.start_auto_connect()
         # self.initialise_user_board()
         # Initial plot render
@@ -673,6 +678,8 @@ class AppUI:
                             self.pulse_width = float(width)
                             self.pending_pulse_width = float(width)
                             self.pulse_width_var.set(f"Pulse Width: {self.pulse_width:.2f}")
+                            self._refresh_max_stim_freq_indicator()
+                            self._clamp_pending_stim_frequency(log_clip=True)
                             self.log_event(f"Control board width updated: {width}")
                             try:
                                 self.update_plot()
@@ -710,11 +717,7 @@ class AppUI:
                             # Frequency is transported as INT32 Hz
                             self.stim_frequency = int(freq)
                             self.pending_stim_frequency = float(self.stim_frequency)
-                            try:
-                                self.stim_freq_entry.delete(0, END)
-                                self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
-                            except Exception:
-                                pass
+                            self._clamp_pending_stim_frequency(log_clip=True)
                             self.log_event(f"Control board frequency updated: {self.stim_frequency} Hz")
                             try:
                                 self.update_plot()
@@ -906,9 +909,41 @@ class AppUI:
         except Exception:
             pass
 
+    def _get_max_stim_frequency(self):
+        try:
+            width = float(getattr(self, "pending_pulse_width", 0.0) or 0.0)
+        except Exception:
+            width = 0.0
+        if width <= 0.0:
+            return None
+        return 1.0 / (11.0 * width)
+
+    def _refresh_max_stim_freq_indicator(self):
+        max_freq = self._get_max_stim_frequency()
+        if max_freq is None:
+            self.max_stim_freq_var.set("Max: — Hz")
+        else:
+            self.max_stim_freq_var.set(f"Max: {max_freq:.2f} Hz (11x PW)")
+
+    def _clamp_pending_stim_frequency(self, log_clip=False):
+        if self.pending_stim_frequency < 0.0:
+            self.pending_stim_frequency = 0.0
+        max_freq = self._get_max_stim_frequency()
+        if max_freq is not None and self.pending_stim_frequency > max_freq:
+            if log_clip:
+                self.log_event(f"Stim Frequency exceeds max for current Pulse Width; clipping to {max_freq:.2f} Hz")
+            self.pending_stim_frequency = max_freq
+        try:
+            self.stim_freq_entry.delete(0, END)
+            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+        except Exception:
+            pass
+
     def pulse_width_up(self):
         self.pending_pulse_width += 1.00
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+        self._refresh_max_stim_freq_indicator()
+        self._clamp_pending_stim_frequency(log_clip=True)
         try:
             self.update_plot()
         except Exception:
@@ -919,6 +954,8 @@ class AppUI:
         if self.pending_pulse_width < 0:
             self.pending_pulse_width = 0
         self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+        self._refresh_max_stim_freq_indicator()
+        self._clamp_pending_stim_frequency(log_clip=True)
         try:
             self.update_plot()
         except Exception:
@@ -927,11 +964,7 @@ class AppUI:
     def stim_freq_up(self):
         """Increase pending stimulation frequency and update entry."""
         self.pending_stim_frequency += 1.00
-        try:
-            self.stim_freq_entry.delete(0, END)
-            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
-        except Exception:
-            pass
+        self._clamp_pending_stim_frequency(log_clip=True)
         try:
             self.update_plot()
         except Exception:
@@ -940,13 +973,7 @@ class AppUI:
     def stim_freq_down(self):
         """Decrease pending stimulation frequency and update entry."""
         self.pending_stim_frequency -= 1.00
-        if self.pending_stim_frequency < 0:
-            self.pending_stim_frequency = 0
-        try:
-            self.stim_freq_entry.delete(0, END)
-            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
-        except Exception:
-            pass
+        self._clamp_pending_stim_frequency(log_clip=False)
         try:
             self.update_plot()
         except Exception:
@@ -987,6 +1014,8 @@ class AppUI:
             self.pending_stim_amplitude = 0.0
         self.stim_amplitude = self.pending_stim_amplitude
         self.pulse_width = self.pending_pulse_width
+        self._refresh_max_stim_freq_indicator()
+        self._clamp_pending_stim_frequency(log_clip=True)
         # Normalise frequency and burst length to integer values for transport
         try:
             self.stim_frequency = int(self.pending_stim_frequency)
@@ -1242,8 +1271,12 @@ class AppUI:
         """Update the pending pulse width from the entry box."""
         try:
             value = float(self.pulse_width_entry.get())
+            if value < 0.0:
+                value = 0.0
             self.pending_pulse_width = value
             self.pulse_width_var.set(f"Pulse Width: {self.pending_pulse_width:.2f}")
+            self._refresh_max_stim_freq_indicator()
+            self._clamp_pending_stim_frequency(log_clip=True)
         except ValueError:
             self.log_event("Invalid input for Pulse Width")
         try:
@@ -1256,6 +1289,7 @@ class AppUI:
         try:
             value = float(self.stim_freq_entry.get())
             self.pending_stim_frequency = value
+            self._clamp_pending_stim_frequency(log_clip=True)
         except ValueError:
             self.log_event("Invalid input for Stim Frequency")
         try:

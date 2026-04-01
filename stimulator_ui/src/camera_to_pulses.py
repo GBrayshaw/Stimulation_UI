@@ -3,6 +3,7 @@ from tkinter import messagebox, filedialog, simpledialog
 
 from metavision_sdk_core import PolarityFilterAlgorithm
 from metavision_sdk_stream import Camera, CameraStreamSlicer
+import traceback
 from metavision_sdk_ui import MTWindow, BaseWindow, EventLoop
 import numpy as np
 from collections import deque
@@ -21,6 +22,8 @@ from cri.robot import SyncRobot, AsyncRobot
 from cri.controller import RTDEController 
 from cri.controller import MG400Controller as Controller
 
+from robot_controller import RobotController
+
 MODE = uart_protocol.MODE
 PAYLOAD_TYPE = uart_protocol.PAYLOAD_TYPE
 UART_START_BYTE = uart_protocol.UART_START_BYTE
@@ -30,11 +33,12 @@ UART_END_BYTE = uart_protocol.UART_END_BYTE
 class IO2Pulse:
     def __init__(self, serial_port: str = "/dev/ttyUSB0", baudrate: int = uart_protocol.CONTROL_BOARD_UART_BAUD_RATE):
         # Triggers out
-        # GPIO27 & GND (Pin 13 and 14)
+        # GPIO27 & GND
         # Triggers in
-        # GPIO13 and GND (Pin 33 and 34)
-        self.trigger_out = DigitalOutputDevice(pin="GPIO27", active_high=True, initial_value=False)
-        self.trigger_in = DigitalInputDevice(pin="GPIO13", pull_up=False, active_state=None) #TODO: Set to False when wired in
+        # GPIO15 and GND
+        self.trigger_out = DigitalOutputDevice(pin="GPIO27", active_high=False, initial_value=False)
+        self.trigger_in = DigitalInputDevice(pin="GPIO15", pull_up=True, active_state=None)
+        self.trigger_in.when_deactivated = self.log_trigger
 
         # Camera objects (connected via connect_camera)
         self.camera = None
@@ -51,15 +55,15 @@ class IO2Pulse:
         # Stimulation parameters
         self.pulse_width = 0            # in microseconds
         self.stim_amplitude = 0.0       # in appropriate current units (e.g. uA)
-        self.low_frequency = 200    # Hardcoded frequencies of stimulation 
+        self.low_frequency = 200        # Hardcoded frequencies of stimulation 
         self.mid_frequency = 500
         self.high_frequency = 1000
         self.frequency = self.high_frequency    # in Hz NOTE: SET TO 0 AFTER TESTING
 
         # Spike encoding parameters
-        self.high_spike_threshold = 20000  # Spike rates for trigger logic
-        self.mid_spike_threshold = 10000
-        self.low_spike_threshold = 5000
+        self.high_spike_threshold = 2000  # Spike rates for trigger logic
+        self.mid_spike_threshold = 1500
+        self.low_spike_threshold = 1000
         self.time_window_us = 10000   # Time window for spike counting in microseconds
         # Sliding time-window spike counting state
         self._window_start_ts = None   # start timestamp (µs) of current counting window
@@ -80,12 +84,8 @@ class IO2Pulse:
         # UART listener thread for inter-Pi state messages
         self._uart_thread = None
 
-        # Input pulse feedback logging thread
+        # Input pulse feedback logging queue
         self.timestamps_us = deque()
-        self.levels = deque()
-        self.window_size_us = 5_000_000  # 5 seconds in microseconds
-        self._timestamp_thread = threading.Thread(target=self.trigger_in_thread, daemon=True)
-        self._timestamp_thread.start()
         
         # Event camera processing thread (run loop)
         self._camera_thread = None
@@ -102,42 +102,12 @@ class IO2Pulse:
         self._slice_events = deque()
         self.slice_events_window_s = 5.0
 
-    # Logging trigger input state changes
-    def trigger_in_thread(self):
-        """Background thread: record microsecond timestamps on every input edge.
-
-        Uses gpiozero's edge waiting to avoid busy-waiting, and stores a rolling
-        window of (timestamp_us, level) samples.
+    def log_trigger(self):
+        """ 
+        Log timestamp of trigger when recieved
         """
-        last_state = int(self.trigger_in.value)
         t_us = time.monotonic_ns() // 1000
         self.timestamps_us.append(t_us)
-        self.levels.append(last_state)
-
-        while not self._stop_event.is_set():
-            # Wait for the next edge (high->low or low->high)
-            if last_state:
-                self.trigger_in.wait_for_inactive(timeout=1.0)
-            else:
-                self.trigger_in.wait_for_active(timeout=1.0)
-
-            if self._stop_event.is_set():
-                break
-
-            # Record timestamp at the moment the edge is detected
-            t_us = time.monotonic_ns() // 1000
-            state = int(self.trigger_in.value)
-
-            self.timestamps_us.append(t_us)
-            self.levels.append(state)
-
-            # Maintain rolling window
-            cutoff = t_us - self.window_size_us
-            while self.timestamps_us and self.timestamps_us[0] < cutoff:
-                self.timestamps_us.popleft()
-                self.levels.popleft()
-
-            last_state = state
 
     # ----------------------------
     # UART framing and state handling
@@ -501,10 +471,12 @@ class IO2Pulse:
 
         try:
             cam = Camera.from_first_available()
-        except Exception:
+        except Exception as e:
+            print(f"[Camera ERROR] Camera.from_first_available() failed: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
             self.camera = None
             self.slicer = None
-            self.log_message("Camera connection failed: exception from Camera.from_first_available().")
+            self.log_message(f"Camera connection failed: {type(e).__name__}: {e}")
             return False
 
         if cam is None:
@@ -516,10 +488,12 @@ class IO2Pulse:
         self.camera = cam
         try:
             self.slicer = CameraStreamSlicer(self.camera.move())
-        except Exception:
+        except Exception as e:
+            print(f"[Camera ERROR] CameraStreamSlicer creation failed: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
             self.camera = None
             self.slicer = None
-            self.log_message("Camera connection failed: error creating stream slicer.")
+            self.log_message(f"Camera connection failed: error creating stream slicer: {type(e).__name__}: {e}")
             return False
 
         # Record camera connection start time for plotting
@@ -685,9 +659,11 @@ class IO2Pulse:
                     # Push a copy so the UI thread owns the buffer
                     self._push_display_frame(display_frame.copy())
 
-        except Exception:
+        except Exception as e:
             # Treat any exception as a lost camera connection
-            self.log_message("Camera stream error: disconnecting camera.")
+            print(f"[Camera ERROR] Camera stream lost: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+            self.log_message(f"Camera stream error: {type(e).__name__}: {e}")
             self.camera = None
             self.slicer = None
 
@@ -712,163 +688,6 @@ class IO2Pulse:
             self.set_frequency(self.high_frequency)
             return True
 
-
-class RobotController:
-    def __init__(self, connect: bool = True):
-        self.base_frame = (353, 18, -35, 0, 0, 90)	# base frame: x->front, y->left, z->up, rz->anticlockwise
-        self.work_frame = (353, 18, -80, 0, 0, 90)
-        self.tap_move = None
-        self.tcp = (0, 0, -50, 0, 0, 0)
-        self.linear_speed = 0
-
-        # In-memory metadata dictionary describing the robot configuration
-        self.meta = {
-            "base_frame": list(self.base_frame),
-            "work_frame": list(self.work_frame),
-            "tap_move": self.tap_move,
-            "tcp": list(self.tcp),
-            "linear_speed": self.linear_speed,
-        }
-
-        # Optional hardware connection. For UI meta operations we may
-        # construct this controller with connect=False to avoid blocking
-        # if robot hardware is unavailable.
-        self.robot = None
-        if connect:
-            try:
-                self.robot = self._make_robot()
-            except Exception:
-                self.robot = None
-
-            # If the robot was created successfully, try to apply the
-            # configured frames and speed, but do not discard the robot
-            # object if any of these assignments fail.
-            if self.robot is not None:
-                try:
-                    self.robot.tcp = self.tcp
-                except Exception:
-                    pass
-                try:
-                    self.robot.coord_frame = self.base_frame
-                except Exception:
-                    pass
-                try:
-                    self.robot.speed = self.linear_speed
-                except Exception:
-                    pass
-
-    def _make_robot(self) -> AsyncRobot:
-        return AsyncRobot(SyncRobot(Controller()))
-
-    def close_robot(self):
-        if self.robot is not None:
-            try:
-                self.robot.close()
-            except Exception:
-                pass
-            self.robot = None
-
-    def make_meta(self, filename):
-        """Save the current robot configuration to a JSON meta file."""
-        # Refresh meta from current attributes
-        self.meta = {
-            "base_frame": list(self.base_frame),
-            "work_frame": list(self.work_frame),
-            "tap_move": self.tap_move,
-            "tcp": list(self.tcp),
-            "linear_speed": self.linear_speed,
-        }
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(self.meta, f, indent=2)
-
-    def get_meta(self, filename):
-        """Load robot configuration from a JSON meta file into this instance."""
-        with open(filename, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Update attributes from the loaded meta, falling back to existing
-        # values when keys are missing.
-        if "base_frame" in data:
-            self.base_frame = tuple(data["base_frame"])
-        if "work_frame" in data:
-            self.work_frame = tuple(data["work_frame"])
-        if "tap_move" in data:
-            self.tap_move = data["tap_move"]
-        if "tcp" in data:
-            self.tcp = tuple(data["tcp"])
-        if "linear_speed" in data:
-            self.linear_speed = data["linear_speed"]
-
-        # Keep meta in sync
-        self.meta = {
-            "base_frame": list(self.base_frame),
-            "work_frame": list(self.work_frame),
-            "tap_move": self.tap_move,
-            "tcp": list(self.tcp),
-            "linear_speed": self.linear_speed,
-        }
-
-        # If a robot instance exists, update its runtime configuration
-        if getattr(self, "robot", None) is not None:
-            try:
-                self.robot.tcp = self.tcp
-            except Exception:
-                pass
-            try:
-                self.robot.coord_frame = self.base_frame
-            except Exception:
-                pass
-            try:
-                self.robot.speed = self.linear_speed
-            except Exception:
-                pass
-
-    def move_home(self):
-        """Move the robot to the home pose in the base frame."""
-        if self.robot is None:
-            raise RuntimeError("Robot not connected")
-        # Ensure we are in the correct frame, then move to origin
-        try:
-            self.robot.coord_frame = self.base_frame
-        except Exception:
-            pass
-        self.robot.move_linear((0, 0, 0, 0, 0, 0))
-
-    def perform_tap(self, hold_time: int = 0):
-        """Perform a tap motion using the configured tap_move poses.
-
-        Expects tap_move to be a 2-element sequence of poses
-        [up_pose, down_pose]. The robot moves home, into the work frame,
-        then down to the tap, holds for hold_time seconds, returns up,
-        and finally goes home again.
-        """
-        if self.robot is None:
-            raise RuntimeError("Robot not connected")
-
-        tap_move = self.meta.get("tap_move", None)
-        if tap_move is None:
-            raise RuntimeError("Tap move not configured")
-        if not isinstance(tap_move, (list, tuple)) or len(tap_move) != 2:
-            raise RuntimeError("tap_move must be a sequence of two poses [up, down]")
-
-        up_pose, down_pose = tap_move
-
-        # Go to home, then into work frame at origin
-        self.move_home()
-        try:
-            self.robot.coord_frame = self.work_frame
-        except Exception:
-            pass
-        self.robot.move_linear((0, 0, 0, 0, 0, 0))
-
-        # Execute tap: down, hold, up
-        self.robot.move_linear(tuple(down_pose))
-        if hold_time > 0:
-            time.sleep(hold_time)
-        self.robot.move_linear(tuple(up_pose))
-
-        # Return home when finished
-        self.move_home()
 
 class CameraIOApp:
     """Simple Tk UI wrapper around IO2Pulse for manual control.
