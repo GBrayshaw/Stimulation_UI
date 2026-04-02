@@ -8,6 +8,7 @@ import serial.tools.list_ports
 import os
 import subprocess
 import time
+import math
 
 class AppUI:
     def __init__(self, master):
@@ -844,33 +845,57 @@ class AppUI:
         except Exception:
             pass
 
-    def _get_max_stim_frequency(self):
+    def _get_current_pulse_width_us(self):
+        # Prefer the live entry value (if valid), otherwise use pending.
+        try:
+            raw = self.pulse_width_entry.get().strip()
+            if raw != "":
+                width = float(raw)
+                if width > 0.0:
+                    return width
+        except Exception:
+            pass
         try:
             width = float(getattr(self, "pending_pulse_width", 0.0) or 0.0)
         except Exception:
             width = 0.0
         if width <= 0.0:
             return None
-        return 1.0 / (11.0 * width)
+        return width
+
+    def _get_max_stim_frequency(self):
+        width_us = self._get_current_pulse_width_us()
+        if width_us is None:
+            return None
+        # Pulse width is specified in microseconds.
+        # Max frequency = 1 / (11 * pulse_width_seconds)
+        return 1_000_000.0 / (11.0 * width_us)
+
+    def _get_max_stim_frequency_limit(self):
+        max_freq = self._get_max_stim_frequency()
+        if max_freq is None:
+            return None
+        # Frequency is transported as INT32 Hz.
+        return float(max(0, math.floor(max_freq)))
 
     def _refresh_max_stim_freq_indicator(self):
-        max_freq = self._get_max_stim_frequency()
+        max_freq = self._get_max_stim_frequency_limit()
         if max_freq is None:
             self.max_stim_freq_var.set("Max: — Hz")
         else:
-            self.max_stim_freq_var.set(f"Max: {max_freq:.2f} Hz (11x PW)")
+            self.max_stim_freq_var.set(f"Max: {max_freq:.4f} Hz (11x PW)")
 
     def _clamp_pending_stim_frequency(self, log_clip=False):
         if self.pending_stim_frequency < 0.0:
             self.pending_stim_frequency = 0.0
-        max_freq = self._get_max_stim_frequency()
+        max_freq = self._get_max_stim_frequency_limit()
         if max_freq is not None and self.pending_stim_frequency > max_freq:
             if log_clip:
-                self.log_event(f"Stim Frequency exceeds max for current Pulse Width; clipping to {max_freq:.2f} Hz")
+                self.log_event(f"Stim Frequency exceeds max for current Pulse Width; clipping to {max_freq:.4f} Hz")
             self.pending_stim_frequency = max_freq
         try:
             self.stim_freq_entry.delete(0, END)
-            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.2f}")
+            self.stim_freq_entry.insert(0, f"{self.pending_stim_frequency:.4f}")
         except Exception:
             pass
 
