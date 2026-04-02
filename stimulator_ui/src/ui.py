@@ -34,6 +34,8 @@ class AppUI:
         self._last_interlocks_on = None
         self._last_stim_on = None
         self._last_status_code = None
+        # When True, external-trigger stimulation stays armed until STOP is pressed.
+        self.external_stim_latched = False
 
         # Display Labels
         self.stim_amplitude_var = StringVar()
@@ -47,6 +49,18 @@ class AppUI:
         self.pulse_width_var.set("Pulse Width: —")
         self.pulse_width_label = Label(master, textvariable=self.pulse_width_var)
         self.pulse_width_label.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
+
+        self.stim_frequency_var = StringVar()
+        # Show placeholder until first value received from control board
+        self.stim_frequency_var.set("Stim Frequency: — Hz")
+        self.stim_frequency_label = Label(master, textvariable=self.stim_frequency_var)
+        self.stim_frequency_label.grid(row=4, column=0, columnspan=2, padx=10, pady=10)
+
+        self.burst_length_var = StringVar()
+        # Show placeholder until first value received from control board
+        self.burst_length_var.set("Burst Length: — us")
+        self.burst_length_label = Label(master, textvariable=self.burst_length_var)
+        self.burst_length_label.grid(row=6, column=0, columnspan=2, padx=10, pady=10)
 
         # self.nerve_impedance_var = StringVar()
         # self.nerve_impedance_var.set(f"Nerve Impedance: {self.nerve_impedance:.2f}ohms")
@@ -76,9 +90,6 @@ class AppUI:
         self.pulse_width_entry.bind("<Return>", self.update_pulse_width)
 
         # Additional stimulation parameters: frequency and burst length
-        self.stim_freq_label = Label(master, text="Stim Frequency (Hz)")
-        # Align header with Stim Amplitude / Pulse Width headers
-        self.stim_freq_label.grid(row=4, column=0, columnspan=2, padx=10, pady=(10, 0))
         self.max_stim_freq_var = StringVar()
         self.max_stim_freq_var.set("Max: — Hz")
         self.max_stim_freq_label = Label(master, textvariable=self.max_stim_freq_var)
@@ -93,9 +104,6 @@ class AppUI:
         self.stim_freq_down_but.grid(row=5, column=1, padx=10, pady=5)
         self.stim_freq_entry.bind("<Return>", self.update_stim_freq)
 
-        self.burst_len_label = Label(master, text="Burst Length (us)")
-        # Align header with Stim Amplitude / Pulse Width headers
-        self.burst_len_label.grid(row=6, column=0, columnspan=2, padx=10, pady=(10, 0))
         self.burst_len_entry = Entry(master, state=DISABLED)
         # Align box with Stim Amplitude / Pulse Width boxes (entry column)
         self.burst_len_entry.grid(row=7, column=2, padx=10, pady=5)
@@ -423,6 +431,8 @@ class AppUI:
             try:
                 self.stim_amplitude_var.set("Stim Amplitude: — uA")
                 self.pulse_width_var.set("Pulse Width: —")
+                self.stim_frequency_var.set("Stim Frequency: — Hz")
+                self.burst_length_var.set("Burst Length: — us")
             except Exception:
                 pass
             self.disable_uart_controls()
@@ -471,6 +481,7 @@ class AppUI:
                         self.log_event(f"Shutdown message received from: {origin}")
                     # After any shutdown, enable Unlock Interlocks if still connected
                     try:
+                        self.external_stim_latched = False
                         if self.control_uart:
                             self.interlocks_on = True
                             self.stim_on = False
@@ -529,9 +540,12 @@ class AppUI:
                             self.stim_on = True
                             self.update_control_button_states()
                         elif code == getattr(SC, 'STATUS_STIM_OFF', 4):
-                            msg = "Stim Status: Stimulation OFF"
-                            self.stim_on = False
-                            self.update_control_button_states()
+                            if self.external_stim_latched and self._is_external_trigger_mode():
+                                msg = "Stim Status: Stimulation OFF (ignored while external trigger latch is active)"
+                            else:
+                                msg = "Stim Status: Stimulation OFF"
+                                self.stim_on = False
+                                self.update_control_button_states()
                         elif code == getattr(SC, 'STATUS_DAC_VALUE_SET', 5):
                             msg = "Status: DAC value set"
                         elif code == getattr(SC, 'STATUS_DAC_ZEROED', 6):
@@ -540,6 +554,7 @@ class AppUI:
                             msg = "Control Status: Shutdown routine complete"
                             # Control board reports shutdown sequence complete: system is safe/locked
                             if self.control_uart:
+                                self.external_stim_latched = False
                                 self.interlocks_on = True
                                 self.stim_on = False
                                 self.update_control_button_states()
@@ -551,14 +566,18 @@ class AppUI:
                             msg = "Control Status: Stim link up"
                         elif code == getattr(SC, 'STATUS_SYSTEM_SAFE_LOCKED', 110):
                             msg = "System Status: SAFE LOCKED"
+                            self.external_stim_latched = False
                             self.interlocks_on = True
                             self.stim_on = False
                             self.update_control_button_states()
                         elif code == getattr(SC, 'STATUS_SYSTEM_IDLE_UNLOCKED', 111):
-                            msg = "System Status: IDLE UNLOCKED"
-                            self.interlocks_on = False
-                            self.stim_on = False
-                            self.update_control_button_states()
+                            if self.external_stim_latched and self._is_external_trigger_mode():
+                                msg = "System Status: IDLE UNLOCKED (ignored while external trigger latch is active)"
+                            else:
+                                msg = "System Status: IDLE UNLOCKED"
+                                self.interlocks_on = False
+                                self.stim_on = False
+                                self.update_control_button_states()
                         elif code == getattr(SC, 'STATUS_SYSTEM_STIMULATING', 112):
                             msg = "System Status: STIMULATING"
                             self.interlocks_on = False
@@ -653,6 +672,7 @@ class AppUI:
                             # Frequency is transported as INT32 Hz
                             self.stim_frequency = int(freq)
                             self.pending_stim_frequency = float(self.stim_frequency)
+                            self.stim_frequency_var.set(f"Stim Frequency: {self.stim_frequency} Hz")
                             self._clamp_pending_stim_frequency(log_clip=True)
                             self.log_event(f"Control board frequency updated: {self.stim_frequency} Hz")
                             try:
@@ -669,6 +689,7 @@ class AppUI:
                             # Burst length is transported as INT32 microseconds
                             self.burst_length = int(burst)
                             self.pending_burst_length = float(self.burst_length)
+                            self.burst_length_var.set(f"Burst Length: {self.burst_length} us")
                             try:
                                 self.burst_len_entry.delete(0, END)
                                 self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
@@ -868,7 +889,7 @@ class AppUI:
         if width_us is None:
             return None
         # Pulse width is specified in microseconds.
-        # Max frequency = 1 / (11 * pulse_width_seconds)
+        # Max frequency = 1 / (11 * pulse_width_microseconds) to ensure at least 10x pulse width gap for repolorisation + 1x pulse width for the pulse itself.
         return 1_000_000.0 / (11.0 * width_us)
 
     def _get_max_stim_frequency_limit(self):
@@ -925,6 +946,7 @@ class AppUI:
         """Increase pending stimulation frequency and update entry."""
         self.pending_stim_frequency += 1.00
         self._clamp_pending_stim_frequency(log_clip=True)
+        self.stim_frequency_var.set(f"Stim Frequency: {self.pending_stim_frequency:.4f} Hz")
         try:
             self.update_plot()
         except Exception:
@@ -934,6 +956,7 @@ class AppUI:
         """Decrease pending stimulation frequency and update entry."""
         self.pending_stim_frequency -= 1.00
         self._clamp_pending_stim_frequency(log_clip=False)
+        self.stim_frequency_var.set(f"Stim Frequency: {self.pending_stim_frequency:.4f} Hz")
         try:
             self.update_plot()
         except Exception:
@@ -942,6 +965,7 @@ class AppUI:
     def burst_len_up(self):
         """Increase pending burst length and update entry."""
         self.pending_burst_length += 1.00
+        self.burst_length_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
         try:
             self.burst_len_entry.delete(0, END)
             self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
@@ -953,6 +977,7 @@ class AppUI:
         self.pending_burst_length -= 1.00
         if self.pending_burst_length < 0:
             self.pending_burst_length = 0
+        self.burst_length_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
         try:
             self.burst_len_entry.delete(0, END)
             self.burst_len_entry.insert(0, f"{self.pending_burst_length:.2f}")
@@ -1022,7 +1047,10 @@ class AppUI:
             self.log_event("Cannot STOP: control board not connected.")
             return
         try:
+            self.external_stim_latched = False
+            self.stim_on = False
             self.control_uart.send_shutdown()
+            self.update_control_button_states()
             self.log_event("STOP: sent SHUTDOWN to control board.")
         except Exception as e:
             self.log_event(f"STOP: failed to send SHUTDOWN: {e}")
@@ -1046,11 +1074,24 @@ class AppUI:
 
         internal = (mode_val == 0)
         try:
-            self.control_uart.set_trigger_mode(internal)
+            if hasattr(self.control_uart, "set_trigger_mode"):
+                self.control_uart.set_trigger_mode(internal)
+            else:
+                # Backward-compatible fallback for older UART_COMMS objects.
+                msg_name = "UART_MSG_TRIG_INTERNAL" if internal else "UART_MSG_TRIG_EXTERNAL"
+                msg_type = getattr(getattr(uart_protocol, "MODE", object), msg_name, None)
+                if msg_type is None:
+                    msg_type = 0x14 if internal else 0x15
+                if hasattr(self.control_uart, "_send_packet"):
+                    self.control_uart._send_packet(msg_type)
+                else:
+                    raise AttributeError("UART object has neither set_trigger_mode nor _send_packet")
         except Exception as e:
             self.log_event(f"Failed to send trigger mode: {e}")
+            return
 
         if internal:
+            self.external_stim_latched = False
             self.log_event("INTERNAL TRIGGERS")
         else:
             self.log_event("EXTERNAL TRIGGERS")
@@ -1250,6 +1291,7 @@ class AppUI:
             value = float(self.stim_freq_entry.get())
             self.pending_stim_frequency = value
             self._clamp_pending_stim_frequency(log_clip=True)
+            self.stim_frequency_var.set(f"Stim Frequency: {self.pending_stim_frequency:.4f} Hz")
         except ValueError:
             self.log_event("Invalid input for Stim Frequency")
         try:
@@ -1262,6 +1304,7 @@ class AppUI:
         try:
             value = float(self.burst_len_entry.get())
             self.pending_burst_length = value
+            self.burst_length_var.set(f"Burst Length: {self.pending_burst_length:.2f} us")
         except ValueError:
             self.log_event("Invalid input for Burst Length")
 
@@ -1407,6 +1450,12 @@ class AppUI:
         except Exception:
             pass
 
+    def _is_external_trigger_mode(self):
+        try:
+            return self.trigger_mode_var.get() == 1
+        except Exception:
+            return False
+
         # Enforce additional gating based on selected mode and active stimulation.
         try:
             # If mode_var exists, 0 = Recording, 1 = Stimulation
@@ -1468,7 +1517,7 @@ class AppUI:
             except Exception:
                 pass
 
-            if self.stim_on is True:
+            if self.stim_on is True and not (self._is_external_trigger_mode() and self.external_stim_latched):
                 # Treat button as Stop Stim when active
                 try:
                     self.control_uart.send_shutdown()
@@ -1478,11 +1527,17 @@ class AppUI:
             else:
                 self.control_uart.send_start_stim()
                 self.log_event("Start Stim command sent.")
-            # Disable until confirmation via STATUS
-            try:
-                self.start_stim_but.config(state=DISABLED)
-            except Exception:
-                pass
+                if self._is_external_trigger_mode():
+                    self.external_stim_latched = True
+                    self.stim_on = True
+                    self.update_control_button_states()
+            # In internal mode, disable until confirmation via STATUS.
+            # In external mode keep stimulation latched until STOP is pressed.
+            if not self._is_external_trigger_mode():
+                try:
+                    self.start_stim_but.config(state=DISABLED)
+                except Exception:
+                    pass
         except Exception as e:
             self.log_event(f"Stim command failed: {e}")
 
